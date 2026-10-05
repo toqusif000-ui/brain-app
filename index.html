@@ -1,0 +1,111 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self'; manifest-src 'self'; worker-src 'self'; child-src 'self'; connect-src 'self' https://api.github.com; base-uri 'none'; form-action 'none'">
+<meta name="referrer" content="no-referrer">
+<meta name="theme-color" content="#f6f1ea" media="(prefers-color-scheme: light)">
+<meta name="theme-color" content="#1c1916" media="(prefers-color-scheme: dark)">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-title" content="Мозг">
+<meta name="apple-mobile-web-app-status-bar-style" content="default">
+<meta name="format-detection" content="telephone=no">
+<title>Мозг</title>
+<link rel="manifest" href="manifest.webmanifest">
+<link rel="apple-touch-icon" href="icons/icon-180.png">
+<link rel="icon" type="image/png" sizes="192x192" href="icons/icon-192.png">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<!-- Настройка: первый запуск или ключ перестал подходить -->
+<section class="setup" id="setup" hidden>
+  <form class="card" id="setupForm" novalidate>
+    <div class="tag">Личный мозг</div>
+    <h1>Подключение</h1>
+    <p>Вставь ключ доступа GitHub. Он хранится только на этом устройстве и уходит только в GitHub.</p>
+    <label for="token">Ключ доступа</label>
+    <input class="field" id="token" type="password" autocomplete="off" autocapitalize="off"
+           autocorrect="off" spellcheck="false" placeholder="github_pat_…">
+    <button class="btn primary" type="submit">Подключить</button>
+    <button class="btn" type="button" data-act="check">Проверить связь</button>
+    <button class="btn" type="button" data-act="back" id="back" hidden>Назад</button>
+    <p class="setup-msg" id="setupMsg" role="status" aria-live="polite"></p>
+    <p class="hint">Нужен fine-grained-ключ только для репозитория памяти с правом Contents: read and write.</p>
+  </form>
+</section>
+
+<div class="wrap" id="app" hidden>
+  <header class="top">
+    <div>
+      <h1 id="title">Сегодня</h1>
+      <div class="date" id="sub"></div>
+    </div>
+    <button class="icon" type="button" data-act="settings" aria-label="Настройка: ключ доступа">
+      <svg viewBox="0 0 24 24" width="22" height="22" fill="none" stroke="currentColor" stroke-width="2"
+           stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+        <circle cx="8" cy="15" r="4"/><path d="M11 12l8.5-8.5M16 7l3 3M13.5 9.5l2 2"/>
+      </svg>
+    </button>
+  </header>
+
+  <div class="banner" id="banner" role="status" hidden></div>
+
+  <main>
+    <section id="tab-today"></section>
+    <section id="tab-goals" hidden></section>
+    <section id="tab-review" hidden></section>
+    <section id="tab-say" hidden>
+      <form class="say" id="sayForm" novalidate>
+        <label class="sr" for="say">Сообщение</label>
+        <textarea class="field" id="say" rows="5"
+                  placeholder="Нажми на микрофон на клавиатуре и говори. Можно и написать."></textarea>
+        <button class="btn primary" type="submit">Отправить</button>
+      </form>
+      <div id="feed"></div>
+    </section>
+  </main>
+
+  <footer class="foot" id="foot"></footer>
+</div>
+
+<nav class="tabs" id="tabs" aria-label="Разделы" hidden>
+  <button type="button" data-act="tab" data-tab="today">
+    <svg viewBox="0 0 24 24" width="24" height="24" fill="none" stroke="currentColor" stroke-width="2"
+         stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+      <rect x="4" y="4" width="16" height="16" rx="4.5"/><path d="M8.5 12.3l2.4 2.4 4.6-5"/>
+    </svg>
+    <span>Сегодня</span>
+  </button>
+  <button type="button" data-act="tab" data-tab="goals">
+    <svg viewBox="0 0 24 24" width="24" height="24" fill="none" stroke="currentColor" stroke-width="2"
+         stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+      <circle cx="12" cy="12" r="8.5"/><circle cx="12" cy="12" r="4"/><path d="M12 12h.01"/>
+    </svg>
+    <span>Цели</span>
+  </button>
+  <button type="button" data-act="tab" data-tab="review">
+    <svg viewBox="0 0 24 24" width="24" height="24" fill="none" stroke="currentColor" stroke-width="2"
+         stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+      <path d="M6 19.5v-7M12 19.5v-15M18 19.5v-10"/>
+    </svg>
+    <span>Обзор</span>
+  </button>
+  <button type="button" data-act="tab" data-tab="say">
+    <svg viewBox="0 0 24 24" width="24" height="24" fill="none" stroke="currentColor" stroke-width="2"
+         stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+      <rect x="9" y="3" width="6" height="11.5" rx="3"/><path d="M5.5 11.5a6.5 6.5 0 0 0 13 0M12 18v3"/>
+    </svg>
+    <span>Сказать</span>
+  </button>
+</nav>
+
+<noscript><p class="setup">Приложению нужен JavaScript.</p></noscript>
+
+<script src="config.js"></script>
+<script src="logic.js"></script>
+<script src="app.js"></script>
+</body>
+</html>

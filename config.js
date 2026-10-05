@@ -2,4 +2,7 @@
 window.BRAIN_CONFIG = {
   repo: "toqusif000-ui/brain",   // репозиторий памяти: владелец/имя
   utcOffsetMinutes: 180,         // пояс памяти (Москва, UTC+3), пока сводка ещё не загружена
+  // Открытый ключ сервера напоминаний (VAPID): с ним устройство подписывается на пуши. Он не секрет;
+  // закрытая половина лежит только в секретах репозитория памяти.
+  vapidPublicKey: "BMcZV71hIDHwnooVxCUbw-JvuprLQaICfWaGKcKyk5tR_URRuaLKj_JElv1aS58qsh6PnfbasFOtR368es_-k1c",
 };

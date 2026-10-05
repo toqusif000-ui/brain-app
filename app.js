@@ -3,7 +3,7 @@
   "use strict";
 
   const L = window.BrainLogic;
-  const VERSION = "2026-10-05.2";   // та же строка в logic.js
+  const VERSION = "2026-10-05.3";   // та же строка в logic.js
   try {
     // При медленной сети запас может отдать app.js и logic.js разных версий. Один раз перезагружаемся:
     // к этому времени запас уже обновился целиком.
@@ -23,7 +23,10 @@
   const FAST_MS = 5000;      // опрос, пока ждём ответа
   const SLOW_MS = 60000;     // опрос в остальное время
   const TIMEOUT_MS = 15000;  // дольше GitHub не ждём, иначе очередь встанет молча
-  const TABS = ["today", "goals", "review", "say"];
+  // Если и после перезагрузки запас отдаёт logic.js прежнего выпуска, того, что пришло вместе
+  // с напоминаниями, в нём нет: приложение работает как раньше, без них.
+  const OLD_LOGIC = typeof L.pushNotice !== "function";
+  const TABS = L.TABS || ["today", "goals", "review", "say"];
 
   const $ = (id) => document.getElementById(id);
 
@@ -36,6 +39,17 @@
     try {
       return navigator.standalone === true ||
         (typeof matchMedia === "function" && matchMedia("(display-mode: standalone)").matches);
+    } catch (e) {
+      return false;
+    }
+  })();
+
+  // Напоминания (пуши) на iPhone работают только в приложении с экрана «Домой».
+  // В обычной вкладке о них не говорим ни слова и ничего для них не делаем.
+  const VAPID = String(CFG.vapidPublicKey || "");
+  const CAN_PUSH = HOME && !MOCK && !OLD_LOGIC && !!VAPID && (() => {
+    try {
+      return "serviceWorker" in navigator && "PushManager" in window && "Notification" in window;
     } catch (e) {
       return false;
     }
@@ -78,6 +92,7 @@
   let screen = "";            // "setup" | "app"
   let tab = "today";
   let loaded = false;         // пришёл ли в этом запуске хоть один ответ о сводке
+  let fresh = false;          // удалось ли прочитать сводку в последний раз (тогда ей можно верить про подписку)
   let refreshing = false;
   let flushing = false;
   let checking = false;
@@ -85,6 +100,11 @@
   let pollTimer = 0;
   let saved = true;           // легла ли последняя запись исходящих на устройство
   let held = null;            // сообщение, которое не удалось сохранить: его текст пока остаётся в поле
+  let pushPhase = "";         // что с включением напоминаний: "" | "busy" | "enabled" | "failed"
+  let healFails = 0;          // сколько раз тихая починка подписки не удалась в этом запуске
+  let healed = false;         // подписку сами чиним не больше одного раза за запуск
+  let healing = false;
+  let badge = -1;             // какое число сейчас стоит на значке приложения (-1 — не знаем)
   const keep = new Set();     // задачи, отмеченные на открытом экране: не исчезают из-под пальца
   const fold = { hanging: false, backlog: false };
   const painted = new Map();
@@ -223,7 +243,7 @@
   function trouble(kind, status) {
     let text = L.errorText(kind, status);
     if ((kind === "offline" || kind === "timeout") && confirmed) text += " Показываю последнюю сводку.";
-    if (outbox.some((e) => e.state === "queued")) {
+    if (outbox.some((e) => e.state === "queued" && !e.push)) {
       // обещаем только то, что на самом деле так
       text += !saved ? " Сохранить на устройстве не получилось: не закрывай приложение, пока сообщение не уйдёт."
         : HOME ? " Сказанное сохранено на устройстве — отправлю, как только получится."
@@ -239,6 +259,7 @@
     refreshing = false;
     if (screen !== "app") return;
     loaded = true;
+    fresh = r.kind === "ok";
     if (r.kind === "ok") {
       accept(r.state);
       setBanner("");
@@ -262,6 +283,7 @@
     clearTimeout(pollTimer);
     await refresh();
     await flushOutbox();   // в конце сам назначит следующий опрос
+    await healPush();
   }
 
   // ---------- отправка ----------
@@ -416,6 +438,96 @@
     flushOutbox();
   }
 
+  // ---------- напоминания ----------
+
+  const permission = () => {
+    try { return Notification.permission; } catch (e) { return "default"; }
+  };
+
+  // Воркер, через который идёт подписка. Дольше TIMEOUT_MS его не ждём: иначе «Включаю…» повисло бы навсегда.
+  function swReady() {
+    let timer;
+    const late = new Promise((resolve, reject) => { timer = setTimeout(() => reject(new Error("воркер не готов")), TIMEOUT_MS); });
+    return Promise.race([navigator.serviceWorker.ready, late]).finally(() => clearTimeout(timer));
+  }
+
+  // Подписывает устройство на пуши и кладёт подписку в исходящие: в память она уходит обычным файлом
+  // нажатий, без ИИ. renew — прежняя подписка умерла: сначала снимаем её, иначе браузер вернёт её же.
+  async function subscribePush(renew) {
+    const reg = await swReady();
+    if (renew) {
+      const old = await reg.pushManager.getSubscription();
+      if (old) await old.unsubscribe();
+    }
+    const sub = await reg.pushManager.subscribe({ userVisibleOnly: true, applicationServerKey: L.base64urlToBytes(VAPID) });
+    const op = L.subscribeOp(sub.toJSON(), L.deviceName(navigator.userAgent));
+    if (!op) throw new Error("подписка не по форме");
+    const hash = await L.endpointHash(op.endpoint, crypto.subtle);
+    if (outbox.some((e) => e.push === hash)) return;   // эта подписка уже в исходящих: второй раз не шлём
+    const now = Date.now();
+    outbox.push({ ...L.outboxEntry(L.opsMessage(newId(now), L.isoAt(now, offset()), [op]), now), push: hash });
+    saveLocal();
+    flushOutbox();
+  }
+
+  // Кнопка «Включить». Вопрос о разрешении задаётся первым же действием в обработчике нажатия, подписка —
+  // сразу за ответом, без сети между ними: спросить разрешение iOS даёт только из нажатия.
+  function enablePush() {
+    if (!CAN_PUSH || pushPhase === "busy") return;
+    let asked;
+    try { asked = Promise.resolve(Notification.requestPermission()); } catch (e) { asked = Promise.reject(e); }
+    pushPhase = "busy";
+    render();
+    asked
+      .then(() => (permission() === "granted" ? subscribePush(false).then(() => "enabled") : ""))
+      .catch(() => "failed")
+      .then((phase) => {
+        pushPhase = phase;
+        render();
+      });
+  }
+
+  // Жива ли подписка. При запуске и при каждом возврате в приложение сверяем её с тем, что знает память
+  // (state.push), и чиним молча. Не больше одной попытки за запуск: по кругу не ходим.
+  async function healPush() {
+    if (!CAN_PUSH || healed || healing || !fresh || screen !== "app") return;
+    if (pushPhase === "busy" || permission() !== "granted") return;
+    healing = true;
+    try {
+      const sub = await (await swReady()).pushManager.getSubscription();
+      const hash = sub ? await L.endpointHash(sub.endpoint, crypto.subtle) : "";
+      const act = L.pushHeal({
+        permission: permission(), hash, push: L.pushInfo(confirmed), waiting: outbox.some((e) => e.push),
+      });
+      if (act === "none") return;
+      healed = true;
+      try {
+        await subscribePush(act === "renew");
+      } catch (e) {
+        healed = ++healFails >= 3;   // сбой мог быть разовым: до трёх попыток за запуск
+        throw e;
+      }
+      if (pushPhase === "failed") {  // подписка всё-таки встала — «не получилось» больше неправда
+        pushPhase = "";
+        render();
+      }
+    } catch (e) {
+      /* не вышло — следующая попытка при следующем чтении сводки или запуске */
+    } finally {
+      healing = false;
+    }
+  }
+
+  // Значок на иконке приложения: сколько задач на сегодня ещё открыто. Ноль — значок убираем.
+  function setBadge(count) {
+    if (!HOME || MOCK || count === badge || typeof navigator.setAppBadge !== "function") return;
+    badge = count;
+    try {
+      const done = count ? navigator.setAppBadge(count) : navigator.clearAppBadge();
+      if (done && done.catch) done.catch(() => {});
+    } catch (e) { /* значок — не главное */ }
+  }
+
   // ---------- настройка ----------
 
   function show(name) {
@@ -549,9 +661,22 @@
     return node;
   }
 
+  // Карточка «Включить напоминания» либо одна строка о них; в обычной вкладке — ничего.
+  function pushCard(note) {
+    if (!note || note.kind === "none") return null;
+    if (!note.button) return el("p", { class: "notice", role: "status" }, note.text);
+    return el("section", { class: "card notice" },
+      el("p", null, note.text),
+      el("button", { type: "button", class: "btn primary", data: { act: "push" }, disabled: note.busy }, note.button));
+  }
+
   function renderToday(st, today) {
     const vm = L.deriveToday(st, today, [...keep]);
-    paint("tab-today", vm, () => [
+    const note = OLD_LOGIC ? null : L.pushNotice({
+      installed: HOME, supported: CAN_PUSH, permission: CAN_PUSH ? permission() : "", phase: pushPhase,
+    });
+    paint("tab-today", [vm, note], () => [
+      pushCard(note),
       el("div", { class: "total" },
         el("div", { class: "total-label" },
           el("span", null, "Сделано за день"), el("span", null, `${vm.done} из ${vm.total}`)),
@@ -672,6 +797,7 @@
     else if (tab === "goals") renderGoals(st, today);
     else renderReview(st, today);
     $("foot").textContent = st ? "Сводка от " + L.fmtWhen(st.generated_at, today) : "";
+    if (st && !OLD_LOGIC) setBadge(L.openToday(st, today));
   }
 
   function setTab(name) {
@@ -698,6 +824,7 @@
     else if (act === "settings") toSetup("");
     else if (act === "back") toApp();
     else if (act === "check") tryKey(false);
+    else if (act === "push") enablePush();
   });
   $("setupForm").addEventListener("submit", (ev) => { ev.preventDefault(); tryKey(true); });
   $("sayForm").addEventListener("submit", (ev) => { ev.preventDefault(); sendText(); });
@@ -709,6 +836,8 @@
       flushTaps();          // свернули — не ждём трёх секунд
     } else {
       keep.clear();
+      badge = -1;           // пока приложение было свёрнуто, значок мог поменять пуш
+      if (pushPhase === "enabled") pushPhase = "";   // «Напоминания включены» — до первого ухода из приложения
       wake();
     }
   });
@@ -721,12 +850,17 @@
   $("say").value = String(store.get("draft") || "");
   if (!MOCK && !HOME) $("setupForm").append(el("p", { class: "hint" }, "В обычной вкладке ключ хранится только до её закрытия."));
   setBanner("");
-  setTab(location.hash.slice(1));   // #say и т. п. — открыть сразу нужную вкладку
+  // ?tab=say (так открывает уведомление) или #say — открыть сразу нужную вкладку
+  setTab(OLD_LOGIC ? location.hash.slice(1) : L.startTab(location.search, location.hash));
   if (!MOCK && !L.validRepo(REPO)) toSetup("В config.js неверное имя репозитория памяти.");
   else if (!token) toSetup("");
   else toApp();
 
   if ("serviceWorker" in navigator) {
     window.addEventListener("load", () => { navigator.serviceWorker.register("sw.js").catch(() => {}); });
+    // Нажали на уведомление, когда приложение уже открыто: воркер просит показать нужную вкладку.
+    navigator.serviceWorker.addEventListener("message", (ev) => {
+      if (ev.data && ev.data.type === "tab" && TABS.includes(ev.data.tab)) setTab(ev.data.tab);
+    });
   }
 })();

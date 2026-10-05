@@ -1,7 +1,8 @@
-// Сервис-воркер: держит в запасе только оболочку приложения, чтобы оно открывалось без сети.
+// Сервис-воркер: держит в запасе только оболочку приложения, чтобы оно открывалось без сети,
+// и показывает напоминания (пуши в 9:00 и 21:00 шлёт GitHub Actions из репозитория памяти).
 // Сначала сеть (так обновления приходят сами); запас — если сети нет или она молчит дольше трёх секунд.
-// Ответы GitHub API не кэшируются никогда. Уведомлений здесь пока нет (этап 2).
-const CACHE = "brain-shell-v2";
+// Ответы GitHub API не кэшируются никогда.
+const CACHE = "brain-shell-v3";
 const WAIT_MS = 3000;   // дольше сеть не ждём: с зависшей связью иначе вместо приложения пустой экран
 const SLOW_MS = 10000;  // сеть не уложилась в срок — столько времени остальные файлы отдаём из запаса сразу
 const SHELL = [
@@ -69,4 +70,61 @@ self.addEventListener("fetch", (event) => {
   const fresh = refresh(url.href);
   event.waitUntil(fresh.catch(() => {}));  // опоздавший ответ всё равно обновит запас
   event.respondWith(answer(fresh, url.href));
+});
+
+// ---------- напоминания ----------
+
+const ROOT = new URL("./", self.location).href;   // адрес приложения
+const SAY = ROOT + "?tab=say";
+
+// Куда ведёт уведомление: только внутрь приложения. Всё остальное — на вкладку «Сказать».
+function target(navigate) {
+  if (typeof navigate !== "string" || !navigate) return SAY;
+  try {
+    const href = new URL(navigate, ROOT).href;
+    return href.startsWith(ROOT) ? href : SAY;
+  } catch (err) {
+    return SAY;
+  }
+}
+
+// Пуш: {"web_push": 8030, "notification": {"title", "body", "navigate", "app_badge"}}. Новые iPhone показывают
+// такое уведомление сами, без воркера; на остальных его показываем мы. Показываем всегда, даже если пуш
+// не разобрался: за пуш без уведомления iOS отбирает разрешение.
+self.addEventListener("push", (event) => {
+  let note = null;
+  try { note = event.data.json().notification; } catch (err) { note = null; }
+  const ok = !!note && typeof note.title === "string" && note.title !== "";
+  const jobs = [self.registration.showNotification(ok ? note.title : "Мозг", {
+    body: ok ? String(note.body || "") : "Открой приложение",
+    icon: "icons/icon-192.png",
+    data: { url: target(ok ? note.navigate : "") },
+  })];
+  // Значок на иконке: сколько задач на сегодня открыто, "0" — убрать. Не вышло — уведомление всё равно показано.
+  const count = ok ? Number.parseInt(note.app_badge, 10) : NaN;
+  const nav = self.navigator;
+  if (count >= 0 && nav && typeof nav.setAppBadge === "function") {
+    jobs.push(Promise.resolve().then(() => (count ? nav.setAppBadge(count) : nav.clearAppBadge())).catch(() => {}));
+  }
+  event.waitUntil(Promise.all(jobs));
+});
+
+// Нажатие на уведомление: открытое приложение выводим вперёд и просим показать нужную вкладку;
+// закрытое — открываем по адресу из уведомления.
+self.addEventListener("notificationclick", (event) => {
+  event.notification.close();
+  const url = target(event.notification.data && event.notification.data.url);
+  const tab = new URL(url).searchParams.get("tab") || "say";
+  event.waitUntil((async () => {
+    const windows = await self.clients.matchAll({ type: "window", includeUncontrolled: true });
+    const open = windows.find((client) => String(client.url).startsWith(ROOT));
+    if (open) {
+      open.postMessage({ type: "tab", tab });
+      try {
+        await open.focus();
+        return;
+      } catch (err) { /* вывести вперёд не дали — открываем заново */ }
+    }
+    await self.clients.openWindow(url);
+  })());
 });

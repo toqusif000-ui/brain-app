@@ -103,6 +103,11 @@ button { touch-action: manipulation; -webkit-tap-highlight-color: transparent; c
 .card.main { border-left: 5px solid var(--accent); margin-bottom: 14px; }
 .card.main > .tag { margin-bottom: 4px; }
 
+/* напоминания: карточка «Включить» или одна строка */
+.card.notice { display: grid; gap: 12px; padding: 16px 18px; margin-bottom: 18px; }
+.card.notice > p { font-weight: 600; }
+p.notice { margin: 0 6px 16px; font-size: 14px; color: var(--muted); }
+
 /* цели */
 .goal { border-left: 5px solid var(--accent); margin-bottom: 14px; }
 .goal.complete { border-color: var(--done); }

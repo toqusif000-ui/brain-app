@@ -2,9 +2,10 @@
 // Запуск из папки приложения: node --test tests/
 import test from "node:test";
 import assert from "node:assert/strict";
+import vm from "node:vm";
 import { readFileSync } from "node:fs";
 import L from "../logic.js";
-import { FakeStorage, fakeGitHub, settle, startApp, startWorker } from "./harness.mjs";
+import { FakeStorage, STAGE2, fakeGitHub, fakePush, fakeWindow, hashOf, settle, startApp, startWorker } from "./harness.mjs";
 
 const fixtureText = readFileSync(new URL("../mock/state.json", import.meta.url), "utf8");
 const fixture = () => L.parseState(fixtureText);
@@ -649,10 +650,225 @@ test("пробный режим изображает разбор", () => {
   assert.match(feed[0].reply, /пробный режим/i);
 });
 
+// ---------- напоминания: расчёты ----------
+
+// открытый ключ сервера напоминаний из договорённости с ядром (он же applicationServerKey)
+const VAPID_PUBLIC = "BMcZV71hIDHwnooVxCUbw-JvuprLQaICfWaGKcKyk5tR_URRuaLKj_JElv1aS58qsh6PnfbasFOtR368es_-k1c";
+
+test("config.js: открытый ключ напоминаний на месте, прежние настройки не тронуты", () => {
+  const window = {};
+  vm.runInNewContext(readFileSync(new URL("../config.js", import.meta.url), "utf8"), { window });
+  const cfg = window.BRAIN_CONFIG;
+  assert.deepEqual(Object.keys(cfg).sort(), ["repo", "utcOffsetMinutes", "vapidPublicKey"], "ничего лишнего: закрытого ключа здесь нет");
+  assert.equal(cfg.vapidPublicKey, VAPID_PUBLIC);
+  assert.equal(cfg.repo, "toqusif000-ui/brain");
+  assert.equal(cfg.utcOffsetMinutes, 180);
+  const key = L.base64urlToBytes(cfg.vapidPublicKey);
+  assert.equal(key.length, 65);
+  assert.equal(key[0], 4, "несжатая точка P-256");
+});
+
+test("версия в app.js и logic.js одна и та же", () => {
+  const app = /const VERSION = "([^"]+)"/.exec(readFileSync(new URL("../app.js", import.meta.url), "utf8"));
+  assert.equal(app[1], L.VERSION);
+});
+
+test("base64url → байты", () => {
+  for (let size = 0; size <= 70; size++) {
+    const bytes = Uint8Array.from({ length: size }, (_, i) => (i * 37 + size * 11 + 250) % 256);
+    const text = Buffer.from(bytes).toString("base64url");
+    assert.deepEqual(L.base64urlToBytes(text), bytes, "длина " + size);
+  }
+  assert.deepEqual(L.base64urlToBytes("-_-_"), Uint8Array.from([0xfb, 0xff, 0xbf]), "знаки «-» и «_», а не «+» и «/»");
+  assert.deepEqual(L.base64urlToBytes("Zm8="), Uint8Array.from(Buffer.from("fo")), "«=» в конце не мешает");
+  assert.equal(Buffer.from(L.base64urlToBytes(VAPID_PUBLIC)).toString("base64url"), VAPID_PUBLIC);
+  assert.throws(() => L.base64urlToBytes("a+b/"));
+  assert.throws(() => L.base64urlToBytes("ключ"));
+});
+
+test("отпечаток подписки: первые 16 знаков SHA-256 от адреса", async () => {
+  assert.equal(await L.endpointHash("abc", crypto.subtle), "ba7816bf8f01cfea", "известное значение SHA-256");
+  const endpoint = "https://web.push.apple.com/QGk3fFz8Vn1pLr0aXw7dTt2yYb5cJm9sHh4eUu6iOoKq";
+  const hash = await L.endpointHash(endpoint, crypto.subtle);
+  assert.match(hash, /^[0-9a-f]{16}$/);
+  assert.equal(hash, hashOf(endpoint));
+  assert.notEqual(await L.endpointHash(endpoint + "x", crypto.subtle), hash);
+});
+
+test("что память знает о подписках", () => {
+  assert.equal(L.pushInfo(fixture()), null, "сводка от ядра, которое о напоминаниях не знает");
+  assert.equal(L.pushInfo(null), null);
+  assert.equal(L.pushInfo({ push: "да" }), null);
+  assert.equal(L.pushInfo({ push: ["a"] }), null);
+  assert.deepEqual(L.pushInfo({ push: { endpoints: ["0011223344556677"], broken: false } }),
+    { endpoints: ["0011223344556677"], broken: false });
+  assert.deepEqual(L.pushInfo({ push: { endpoints: [], broken: true } }), { endpoints: [], broken: true });
+  assert.deepEqual(L.pushInfo({ push: {} }), { endpoints: [], broken: false }, "неполная запись читается как «подписок нет»");
+  assert.deepEqual(L.pushInfo({ push: { endpoints: "x", broken: "да" } }), { endpoints: [], broken: false });
+  // разбор сводки поле не теряет
+  const state = L.parseState({ ...JSON.parse(fixtureText), push: { endpoints: ["0011223344556677"], broken: true } });
+  assert.deepEqual(L.pushInfo(state), { endpoints: ["0011223344556677"], broken: true });
+});
+
+test("подписка: чинить или нет", () => {
+  const mine = "0011223344556677";
+  const knows = { endpoints: ["ffffffffffffffff", mine], broken: false };
+  const forgot = { endpoints: ["ffffffffffffffff"], broken: false };
+  const ask = (patch) => L.pushHeal({ permission: "granted", hash: mine, push: knows, waiting: false, ...patch });
+
+  assert.equal(ask({}), "none", "память знает эту подписку");
+  assert.equal(ask({ push: { ...knows, broken: true } }), "none", "сломалась чужая подписка, наша на месте");
+  assert.equal(ask({ push: forgot }), "subscribe", "памяти подписка неизвестна — шлём её снова");
+  assert.equal(ask({ push: { endpoints: [], broken: false } }), "subscribe");
+  assert.equal(ask({ push: { ...forgot, broken: true } }), "renew", "пуш-сервис сказал, что подписки нет: нужна новая");
+  assert.equal(ask({ hash: "" }), "subscribe", "подписки на устройстве нет");
+  assert.equal(ask({ hash: "", push: { endpoints: [], broken: true } }), "subscribe", "снимать нечего");
+
+  // подписка уже в исходящих: ждём, второй раз не шлём
+  assert.equal(ask({ push: forgot, waiting: true }), "none");
+  assert.equal(ask({ push: { ...forgot, broken: true }, waiting: true }), "none");
+  assert.equal(ask({ hash: "", waiting: true }), "none");
+  // разрешения нет — подписку не трогаем
+  for (const permission of ["default", "denied", "", undefined]) {
+    assert.equal(ask({ permission, push: forgot }), "none");
+    assert.equal(ask({ permission, hash: "" }), "none");
+  }
+  // ядро о напоминаниях ещё не знает — сверять не с чем
+  assert.equal(ask({ push: null }), "none");
+  assert.equal(ask({ push: null, hash: "" }), "none");
+});
+
+test("что показать о напоминаниях", () => {
+  const ask = (patch) => L.pushNotice({ installed: true, supported: true, permission: "default", phase: "", ...patch });
+  assert.deepEqual(ask({}), { kind: "offer", text: "Включить напоминания в 9:00 и 21:00", button: "Включить", busy: false });
+  assert.deepEqual(ask({ phase: "busy" }), { kind: "offer", text: "Включить напоминания в 9:00 и 21:00", button: "Включаю…", busy: true });
+  assert.deepEqual(ask({ phase: "busy", permission: "granted" }).button, "Включаю…", "разрешили, подписка ещё идёт");
+  assert.deepEqual(ask({ permission: "granted", phase: "enabled" }), { kind: "enabled", text: "Напоминания включены.", button: "", busy: false });
+  assert.deepEqual(ask({ permission: "granted" }), { kind: "none", text: "", button: "", busy: false }, "включено давно — молчим");
+  assert.deepEqual(ask({ permission: "granted", phase: "failed" }),
+    { kind: "failed", text: "Не получилось включить напоминания.", button: "Попробовать ещё раз", busy: false });
+
+  // запрещено — одна строка, без кнопки: приложение спросить ещё раз не может
+  for (const phase of ["", "busy", "enabled", "failed"]) {
+    const denied = ask({ permission: "denied", phase });
+    assert.equal(denied.kind, "denied");
+    assert.equal(denied.button, "");
+    assert.match(denied.text, /Разреши уведомления для «Мозг»/);
+    assert.match(denied.text, /Настройки iPhone/);
+  }
+
+  // обычная вкладка и устройство без пушей — ничего
+  for (const permission of ["default", "denied", "granted"]) {
+    for (const phase of ["", "busy", "enabled", "failed"]) {
+      assert.equal(ask({ installed: false, permission, phase }).kind, "none");
+      assert.equal(ask({ supported: false, permission, phase }).kind, "none");
+    }
+  }
+  // ни похвалы, ни упрёков, ни восклицаний
+  for (const note of [ask({}), ask({ phase: "failed" }), ask({ permission: "denied" }), ask({ permission: "granted", phase: "enabled" })]) {
+    assert.doesNotMatch(note.text + note.button, /!|молодец|отлично|жаль|подряд/i);
+  }
+});
+
+test("имя устройства по строке браузера", () => {
+  assert.equal(L.deviceName("Mozilla/5.0 (iPhone; CPU iPhone OS 17_4 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Mobile/15E148"), "iPhone");
+  assert.equal(L.deviceName("Mozilla/5.0 (iPad; CPU OS 17_4 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Mobile/15E148"), "iPad");
+  assert.equal(L.deviceName("Mozilla/5.0 (Linux; Android 14; Pixel 8) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Mobile Safari/537.36"), "Android");
+  assert.equal(L.deviceName("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4 Safari/605.1.15"), "Mac");
+  assert.equal(L.deviceName("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36"), "Windows");
+  assert.equal(L.deviceName("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36"), "Linux");
+  assert.equal(L.deviceName(""), "Другое");
+  assert.equal(L.deviceName(undefined), "Другое");
+});
+
+test("операция подписки для входящих — по договорённости с ядром", () => {
+  const sub = {
+    endpoint: "https://web.push.apple.com/QGk3fFz8Vn1pLr0aXw7d",
+    expirationTime: null,
+    keys: { p256dh: "BPkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkk", auth: "aaaaaaaaaaaaaaaaaaaaaa" },
+  };
+  const op = L.subscribeOp(sub, "iPhone");
+  assert.deepEqual(op, { op: "push_subscribe", endpoint: sub.endpoint, p256dh: sub.keys.p256dh, auth: sub.keys.auth, device: "iPhone" });
+  assert.deepEqual(Object.keys(op), ["op", "endpoint", "p256dh", "auth", "device"]);
+  // файл для входящих — обычный файл нажатий
+  const file = L.opsMessage("20261005T092000Z-a1b2c3", "2026-10-05T12:20:00+03:00", [op]);
+  assert.deepEqual(file, { id: "20261005T092000Z-a1b2c3", sent_at: "2026-10-05T12:20:00+03:00", channel: "phone", type: "ops", ops: [op] });
+  assert.deepEqual(JSON.parse(L.inboxBody(file)), file);
+
+  // ключи приводятся к base64url без «=»
+  const padded = L.subscribeOp({ ...sub, keys: { p256dh: "ab+/cd==", auth: "ef/+gh=" } }, "iPhone");
+  assert.deepEqual([padded.p256dh, padded.auth], ["ab-_cd", "ef_-gh"]);
+
+  // подписка не по форме в память не уходит
+  assert.equal(L.subscribeOp(null, "iPhone"), null);
+  assert.equal(L.subscribeOp({}, "iPhone"), null);
+  assert.equal(L.subscribeOp({ ...sub, endpoint: "http://web.push.apple.com/Q" }, "iPhone"), null, "адрес только https");
+  assert.equal(L.subscribeOp({ ...sub, endpoint: "https://" }, "iPhone"), null);
+  assert.equal(L.subscribeOp({ ...sub, endpoint: "https://web.push.apple.com/Q 1" }, "iPhone"), null);
+  assert.equal(L.subscribeOp({ ...sub, endpoint: 5 }, "iPhone"), null);
+  assert.equal(L.subscribeOp({ ...sub, keys: { p256dh: sub.keys.p256dh } }, "iPhone"), null);
+  assert.equal(L.subscribeOp({ ...sub, keys: { p256dh: "", auth: sub.keys.auth } }, "iPhone"), null);
+  assert.equal(L.subscribeOp({ ...sub, keys: { p256dh: "ключ", auth: sub.keys.auth } }, "iPhone"), null);
+  assert.equal(L.subscribeOp({ endpoint: sub.endpoint }, "iPhone"), null);
+});
+
+test("с какой вкладки начать", () => {
+  assert.deepEqual(L.TABS, ["today", "goals", "review", "say"]);
+  for (const tab of L.TABS) {
+    assert.equal(L.startTab("?tab=" + tab, ""), tab);
+    assert.equal(L.startTab("", "#" + tab), tab);
+  }
+  assert.equal(L.startTab("?tab=say", "#review"), "say", "адрес из уведомления главнее");
+  assert.equal(L.startTab("?mock=1&tab=goals", ""), "goals");
+  assert.equal(L.startTab("?tab=чужое", "#review"), "review");
+  assert.equal(L.startTab("?tab=", ""), "today");
+  assert.equal(L.startTab("?tab=settings", "#nope"), "today");
+  assert.equal(L.startTab("", ""), "today");
+  assert.equal(L.startTab(undefined, undefined), "today");
+});
+
+test("число для значка: открытые задачи на сегодня", () => {
+  const state = fixture();
+  assert.equal(L.openToday(state, TODAY), 3);
+  assert.equal(L.openToday(state, "2026-10-06"), 0, "висящие с прошлых дней в значок не идут");
+  assert.equal(L.openToday(state, "2026-10-02"), 1);
+  // своя неподтверждённая отметка уже учтена
+  const task = taskByText(state, "Записать первый урок");
+  const view = L.overlayState(state, L.tapTask({}, task.id, "open", "open"), 0).state;
+  assert.equal(L.openToday(view, TODAY), 2);
+  assert.equal(L.openToday({ ...state, tasks: [] }, TODAY), 0);
+});
+
+test("исходящие: отправленная подписка ждёт, пока сводка её покажет, но не дольше десяти минут", () => {
+  const now = at("2026-10-05T12:30:00+03:00");
+  const mine = "0011223344556677";
+  const op = { op: "push_subscribe", endpoint: "https://web.push.apple.com/Q1", p256dh: "p", auth: "a", device: "iPhone" };
+  const entry = (patch) => ({ ...L.outboxEntry(L.opsMessage("p1", "2026-10-05T12:29:00+03:00", [op]), now), push: mine, ...patch });
+  const sent = { state: "sent", sentAt: now - 1000, dispatched: true };
+  const withPush = (endpoints) => ({ ...fixture(), push: { endpoints, broken: false } });
+  const left = (box, state, when = now) => L.pruneOutbox(box, state, when).map((e) => e.id);
+
+  assert.deepEqual(left([entry({})], withPush([])), ["p1"], "неотправленное не трогаем");
+  assert.deepEqual(left([entry({ state: "sent", sentAt: now - 1000 })], withPush([mine])), ["p1"], "разбор ещё не позвали");
+  assert.deepEqual(left([entry(sent)], withPush([])), ["p1"], "в пути: сводка подписку ещё не показала");
+  assert.deepEqual(left([entry(sent)], withPush(["ffffffffffffffff"])), ["p1"]);
+  assert.deepEqual(left([entry(sent)], fixture()), ["p1"], "сводка без поля push");
+  assert.deepEqual(left([entry(sent)], null), ["p1"], "сводки нет");
+  assert.deepEqual(left([entry(sent)], withPush([mine])), [], "память подписку знает");
+  assert.deepEqual(left([entry(sent)], withPush([]), now - 1000 + L.PUSH_WAIT_MS - 1), ["p1"]);
+  assert.deepEqual(left([entry(sent)], withPush([]), now - 1000 + L.PUSH_WAIT_MS), [], "десять минут прошло");
+  assert.equal(L.PUSH_WAIT_MS, 10 * 60 * 1000);
+  // обычные отметки по-прежнему забываются сразу после отправки
+  assert.deepEqual(left([entry({ ...sent, push: undefined })], withPush([])), []);
+  // подписка в пути частого опроса не требует
+  assert.equal(L.isWaiting([entry(sent)], {}, now), false);
+});
+
 // ---------- приложение целиком: отправка ----------
 
 // Открывает приложение с уже вставленным ключом (key: false — без ключа, на экране настройки).
 // По умолчанию оно установлено на экран «Домой»; home: false — обычная вкладка браузера.
+// push — fakePush(): устройство с уведомлениями; search и hash — хвост адреса (?tab=say, #review).
 async function boot(options = {}) {
   const clock = options.clock || { now: at("2026-10-05T12:20:00+03:00") };
   const gh = options.gh || fakeGitHub(clock, { ...JSON.parse(fixtureText), ...options.state });
@@ -661,7 +877,10 @@ async function boot(options = {}) {
   const home = options.home !== false;
   const disk = home || options.ios ? local : session;   // где приложение должно держать своё
   if (options.key !== false) disk.setItem("brain:token", JSON.stringify("KEY"));
-  const app = startApp({ clock, gh, local, session, home, ios: options.ios });
+  const app = startApp({
+    clock, gh, local, session, home, ios: options.ios,
+    push: options.push, search: options.search, hash: options.hash, oldLogic: options.oldLogic,
+  });
   await settle();
   return { app, gh, clock, local, session, disk };
 }
@@ -899,6 +1118,327 @@ test("приложение с экрана «Домой»: всё хранитс
   }
 });
 
+// ---------- приложение целиком: вкладка из адреса ----------
+
+test("адрес ?tab=say открывает «Сказать»; #review работает как раньше; без хвоста — «Сегодня»", async () => {
+  const say = await boot({ search: "?tab=say" });
+  assert.equal(say.app.text("title"), "Сказать");
+  assert.equal(say.app.el("tab-say").hidden, false);
+  assert.equal(say.app.el("tab-today").hidden, true);
+  assert.equal(say.app.screen(), "app");
+
+  const review = await boot({ hash: "#review" });
+  assert.equal(review.app.text("title"), "Обзор");
+  assert.equal(review.app.el("tab-review").hidden, false);
+
+  const plain = await boot({ search: "?tab=nope" });
+  assert.equal(plain.app.text("title"), "Сегодня");
+  assert.equal(plain.app.el("tab-today").hidden, false);
+});
+
+// ---------- приложение целиком: напоминания ----------
+
+const pushState = (endpoints = [], broken = false) => ({ push: { endpoints, broken } });
+const pushButtons = (app) => app.buttons("tab-today").filter((b) => b.act === "push");
+const subscribeOps = (gh) => gh.accepted.map((id) => gh.files.get(id).ops[0]);
+const Q1 = "https://web.push.apple.com/Q1";      // первая подписка, которую выдаёт поддельный пуш-сервис
+const OLD = "https://web.push.apple.com/QOld";   // подписка, которая была на устройстве до запуска
+
+test("напоминания: «Включить» спрашивает разрешение прямо из нажатия, подписывает и шлёт подписку один раз", async () => {
+  const push = fakePush();
+  const { app, gh, disk, clock } = await boot({ push, state: pushState() });
+  assert.match(app.text("tab-today"), /^Включить напоминания в 9:00 и 21:00 Включить /, "карточка — первой на экране");
+  assert.deepEqual(pushButtons(app), [{ act: "push", text: "Включить", disabled: false }]);
+  assert.deepEqual(push.log, [], "пока не нажали — ничего не спрашиваем и не подписываем");
+  assert.deepEqual(gh.accepted, []);
+
+  const mark = gh.log.length;
+  app.press({ act: "push" });
+  assert.deepEqual(push.log, ["ask"], "вопрос о разрешении — первым делом в обработчике нажатия");
+  assert.equal(gh.log.length, mark, "до вопроса — никакой сети");
+  assert.deepEqual(pushButtons(app), [{ act: "push", text: "Включаю…", disabled: true }]);
+  app.press({ act: "push" });   // нетерпеливое второе нажатие
+  await settle();
+
+  assert.deepEqual(push.log, ["ask", "subscribe"], "подписка — сразу за ответом и один раз");
+  assert.equal(push.options[0].userVisibleOnly, true);
+  assert.equal(Buffer.from(push.options[0].applicationServerKey).toString("base64url"), VAPID_PUBLIC);
+  assert.equal(push.options[0].applicationServerKey.length, 65);
+
+  // подписка ушла обычным файлом нажатий, и разбор позвали
+  const [id] = gh.accepted;
+  assert.deepEqual(gh.log.slice(mark), ["PUT " + id, "POST dispatches"]);
+  assert.match(id, /^\d{8}T\d{6}Z-[0-9a-f]{6}$/);
+  assert.deepEqual(gh.files.get(id), {
+    id, sent_at: "2026-10-05T12:20:00+03:00", channel: "phone", type: "ops",
+    ops: [{ op: "push_subscribe", endpoint: Q1, p256dh: "BP" + "k".repeat(85), auth: "a".repeat(22), device: "iPhone" }],
+  });
+  assert.match(app.text("tab-today"), /^Напоминания включены\. /);
+  assert.deepEqual(pushButtons(app), []);
+
+  // пока память не подтвердила подписку, её не дублируют ни нажатие, ни опрос, ни возврат в приложение
+  app.press({ act: "push" });
+  await settle();
+  await app.wake();
+  await app.back();
+  assert.deepEqual(gh.accepted, [id]);
+  assert.deepEqual(disk.read("outbox").map((e) => [e.id, e.state, e.push]), [[id, "sent", hashOf(Q1)]]);
+  assert.doesNotMatch(app.text("tab-today"), /апоминани/, "вернулись в приложение — строка уже не нужна");
+
+  // память подписку узнала: исходящие пусты, и дальше приложение её не трогает
+  clock.now += 30000;
+  gh.state = { ...gh.state, generated_at: L.isoAt(clock.now, 180), ...pushState([hashOf(Q1)]) };
+  await app.wake();
+  assert.deepEqual(disk.read("outbox"), []);
+  await app.wake();
+  await app.back();
+  assert.deepEqual(gh.accepted, [id]);
+  assert.ok(!push.log.includes("unsubscribe"));
+});
+
+test("напоминания: на вопрос ответили «не разрешать» — одна строка про Настройки, ничего не отправлено", async () => {
+  const push = fakePush({ answer: "denied" });
+  const { app, gh } = await boot({ push, state: pushState() });
+  app.press({ act: "push" });
+  await settle();
+  assert.deepEqual(push.log, ["ask"], "подписываться без разрешения не пробуем");
+  assert.match(app.text("tab-today"), /^Напоминания выключены\. Разреши уведомления для «Мозг»: Настройки iPhone → Уведомления → Мозг\. /);
+  assert.deepEqual(pushButtons(app), [], "кнопки нет: спросить второй раз приложение не может");
+  await app.wake();
+  await app.back();
+  assert.deepEqual(push.log, ["ask"]);
+  assert.deepEqual(gh.accepted, []);
+
+  // так же выглядит запуск, когда уведомления уже запрещены
+  const denied = fakePush({ permission: "denied" });
+  const second = await boot({ push: denied, state: pushState() });
+  assert.match(second.app.text("tab-today"), /Разреши уведомления для «Мозг»/);
+  assert.deepEqual(pushButtons(second.app), []);
+  assert.deepEqual(denied.log, []);
+});
+
+test("напоминания: вопрос закрыли без ответа — карточка остаётся", async () => {
+  const push = fakePush({ answer: "default" });
+  const { app, gh } = await boot({ push, state: pushState() });
+  app.press({ act: "push" });
+  await settle();
+  assert.deepEqual(push.log, ["ask"]);
+  assert.deepEqual(pushButtons(app), [{ act: "push", text: "Включить", disabled: false }]);
+  assert.deepEqual(gh.accepted, []);
+});
+
+test("напоминания: подписаться не вышло — об этом сказано, повтор по кнопке, ничего лишнего не ушло", async () => {
+  const push = fakePush();
+  push.subscribeFails = true;
+  const { app, gh } = await boot({ push, state: pushState() });
+  app.press({ act: "push" });
+  await settle();
+  assert.match(app.text("tab-today"), /^Не получилось включить напоминания\. Попробовать ещё раз /);
+  assert.deepEqual(pushButtons(app), [{ act: "push", text: "Попробовать ещё раз", disabled: false }]);
+  assert.deepEqual(gh.accepted, []);
+
+  push.subscribeFails = false;
+  app.press({ act: "push" });
+  await settle();
+  assert.match(app.text("tab-today"), /^Напоминания включены\. /);
+  assert.deepEqual(subscribeOps(gh).map((op) => [op.op, op.endpoint]), [["push_subscribe", Q1]]);
+});
+
+test("напоминания: включили без связи — подписка ждёт на устройстве и уходит один раз", async () => {
+  const push = fakePush();
+  const first = await boot({ push, state: pushState() });
+  const { gh, clock, local, session } = first;
+  gh.online = false;
+  first.app.press({ act: "push" });
+  await settle();
+  assert.match(first.app.text("tab-today"), /Напоминания включены/);
+  assert.match(first.app.text("banner"), /Нет связи\./);
+  assert.equal(queued(local).length, 1);
+  assert.deepEqual(gh.accepted, []);
+
+  // приложение открыли заново, связи всё ещё нет: сводку прочитать не удалось — подписку не трогаем
+  const second = await boot({ push, gh, clock, local, session });
+  assert.deepEqual(push.log, ["ask", "subscribe"]);
+  assert.equal(queued(local).length, 1);
+
+  gh.online = true;
+  await second.app.wake();
+  await second.app.wake();
+  await second.app.back();
+  assert.deepEqual(subscribeOps(gh).map((op) => op.endpoint), [Q1], "ушла один раз");
+  assert.deepEqual(push.log, ["ask", "subscribe"], "и заново не подписывались");
+});
+
+test("напоминания: память подписку не знает — приложение молча шлёт её снова, один раз за запуск", async () => {
+  const push = fakePush({ permission: "granted", endpoint: OLD });
+  const first = await boot({ push, state: pushState(["ffffffffffffffff"]) });
+  const { app, gh, clock, local, session } = first;
+  assert.deepEqual(push.log, ["subscribe"], "разрешение уже есть: вопросов не задаём, прежнюю подписку не снимаем");
+  assert.equal(push.options[0].userVisibleOnly, true);
+  assert.equal(Buffer.from(push.options[0].applicationServerKey).toString("base64url"), VAPID_PUBLIC);
+  assert.deepEqual(subscribeOps(gh), [{ op: "push_subscribe", endpoint: OLD, p256dh: "BP" + "k".repeat(85), auth: "a".repeat(22), device: "iPhone" }]);
+  assert.equal(gh.dispatches, 1);
+  assert.doesNotMatch(app.text("tab-today"), /апоминани/, "чиним молча");
+
+  // подписка так и не появилась в сводке; прошло больше десяти минут — по кругу не ходим
+  await app.wake();
+  await app.back();
+  clock.now += L.PUSH_WAIT_MS + 1000;
+  await app.wake();
+  await app.back();
+  assert.deepEqual(local.read("outbox"), []);
+  assert.equal(gh.accepted.length, 1);
+  assert.deepEqual(push.log, ["subscribe"]);
+
+  // следующий запуск — ещё одна попытка, и снова только одна
+  const second = await boot({ push, gh, clock, local, session });
+  await second.app.wake();
+  await second.app.back();
+  assert.deepEqual(subscribeOps(gh).map((op) => op.endpoint), [OLD, OLD]);
+  assert.deepEqual(push.log, ["subscribe", "subscribe"]);
+});
+
+test("напоминания: подписки на устройстве нет, а разрешение есть — подписываемся молча", async () => {
+  const push = fakePush({ permission: "granted" });
+  const { app, gh } = await boot({ push, state: pushState() });
+  assert.deepEqual(push.log, ["subscribe"]);
+  assert.deepEqual(subscribeOps(gh).map((op) => [op.op, op.endpoint, op.device]), [["push_subscribe", Q1, "iPhone"]]);
+  assert.deepEqual(pushButtons(app), []);
+  assert.doesNotMatch(app.text("tab-today"), /апоминани/);
+});
+
+test("напоминания: пуш-сервис сообщил, что подписка умерла — снимаем её и шлём новую", async () => {
+  const push = fakePush({ permission: "granted", endpoint: OLD });
+  const { app, gh } = await boot({ push, state: pushState([], true) });
+  assert.deepEqual(push.log, ["unsubscribe", "subscribe"], "иначе браузер вернул бы ту же мёртвую подписку");
+  assert.deepEqual(subscribeOps(gh).map((op) => op.endpoint), [Q1]);
+  await app.wake();
+  await app.back();
+  assert.equal(gh.accepted.length, 1);
+});
+
+test("напоминания: память подписку знает — ничего не делаем, даже если сломалась чужая", async () => {
+  for (const broken of [false, true]) {
+    const push = fakePush({ permission: "granted", endpoint: OLD });
+    const { app, gh } = await boot({ push, state: pushState(["ffffffffffffffff", hashOf(OLD)], broken) });
+    await app.wake();
+    await app.back();
+    assert.deepEqual(push.log, []);
+    assert.deepEqual(gh.accepted, []);
+    assert.doesNotMatch(app.text("tab-today"), /апоминани/);
+  }
+});
+
+test("напоминания: сводка не прочиталась или ядро о них ещё не знает — подписку не трогаем", async () => {
+  // сводка от прежнего ядра: поля push нет
+  const old = fakePush({ permission: "granted", endpoint: OLD });
+  const first = await boot({ push: old });
+  await first.app.wake();
+  await first.app.back();
+  assert.deepEqual(old.log, []);
+  assert.deepEqual(first.gh.accepted, []);
+
+  // на устройстве лежит прошлая сводка без нашей подписки, а свежую прочитать не удалось
+  const push = fakePush({ permission: "granted", endpoint: OLD });
+  const clock = { now: at("2026-10-05T12:20:00+03:00") };
+  const gh = fakeGitHub(clock, { ...JSON.parse(fixtureText), ...pushState([hashOf(OLD)]) });
+  gh.online = false;
+  const local = new FakeStorage({ "brain:state": JSON.stringify({ ...JSON.parse(fixtureText), ...pushState() }) });
+  const { app } = await boot({ push, gh, clock, local });
+  assert.deepEqual(push.log, [], "прошлой сводке про подписку не верим");
+  gh.online = true;
+  await app.wake();
+  assert.deepEqual(push.log, [], "свежая сводка подписку знает");
+  assert.deepEqual(gh.accepted, []);
+});
+
+test("обычная вкладка: о напоминаниях ни слова, подписку и значок не трогаем", async () => {
+  for (const permission of ["default", "denied", "granted"]) {
+    const push = fakePush({ permission, endpoint: OLD });
+    const { app, gh } = await boot({ home: false, push, state: pushState() });
+    assert.equal(app.screen(), "app");
+    assert.doesNotMatch(app.text("tab-today"), /апоминани|ведомлени/);
+    assert.deepEqual(pushButtons(app), []);
+    app.press({ act: "push" });
+    await settle();
+    await app.wake();
+    await app.back();
+    assert.deepEqual(push.log, []);
+    assert.deepEqual(gh.accepted, []);
+    assert.deepEqual(push.badges, []);
+  }
+});
+
+test("запас отдал новый app.js со старым logic.js: одна перезагрузка, дальше приложение работает как раньше, без напоминаний", async () => {
+  for (const name of STAGE2) assert.ok(name in L, name + " — есть в нынешнем logic.js");
+  const push = fakePush({ permission: "granted", endpoint: OLD });
+  const session = new FakeStorage();
+  const first = await boot({ push, session, oldLogic: true, state: pushState() });
+  assert.equal(first.app.reloads(), 1, "версии разошлись — одна перезагрузка");
+  assert.deepEqual(first.gh.log, [], "до перезагрузки приложение ничего не делает");
+
+  // после перезагрузки logic.js всё ещё прежний: работаем как есть
+  const { clock, gh, local } = first;
+  const { app } = await boot({ push, session, clock, gh, local, oldLogic: true, search: "?tab=review", hash: "#say" });
+  assert.equal(app.reloads(), 0, "по кругу не перезагружаемся");
+  assert.equal(app.screen(), "app");
+  assert.equal(app.text("title"), "Сказать", "вкладка — как раньше, из #");
+  await app.click({ act: "tab", tab: "today" });
+  assert.match(app.text("tab-today"), /^Сделано за день 2 из 5 /);
+  assert.deepEqual(pushButtons(app), []);
+  await app.click({ act: "task", id: taskByText(gh.state, "Записать первый урок").id });
+  await app.flushTaps();
+  await app.say("купить домен");
+  await app.back();
+  assert.deepEqual(gh.accepted.map((id) => gh.files.get(id).type), ["ops", "text"], "отметки и сообщения уходят");
+  assert.deepEqual(push.log, [], "подписку не трогаем");
+  assert.deepEqual(push.badges, [], "значок не трогаем");
+});
+
+test("приложение с экрана «Домой» на устройстве без пушей: о напоминаниях ни слова", async () => {
+  const { app, gh } = await boot({ state: pushState() });
+  assert.doesNotMatch(app.text("tab-today"), /апоминани|ведомлени/);
+  app.press({ act: "push" });
+  await settle();
+  await app.wake();
+  assert.deepEqual(gh.accepted, []);
+});
+
+test("воркер просит вкладку (нажали на уведомление при открытом приложении) — приложение её показывает", async () => {
+  const push = fakePush({ permission: "granted", endpoint: OLD });
+  const { app, gh } = await boot({ push, state: pushState([hashOf(OLD)]) });
+  assert.equal(app.text("title"), "Сегодня");
+  await app.swMessage({ type: "tab", tab: "say" });
+  assert.equal(app.text("title"), "Сказать");
+  assert.equal(app.el("tab-say").hidden, false);
+  assert.equal(app.el("tab-today").hidden, true);
+  for (const junk of [{ type: "tab", tab: "чужое" }, { type: "other", tab: "today" }, null, "say", {}]) {
+    await app.swMessage(junk);
+    assert.equal(app.text("title"), "Сказать", "непонятное сообщение ничего не меняет");
+  }
+  await app.swMessage({ type: "tab", tab: "today" });
+  assert.equal(app.text("title"), "Сегодня");
+  assert.deepEqual(gh.accepted, []);
+});
+
+test("значок приложения: открытые задачи на сегодня; ноль — значок убран", async () => {
+  const push = fakePush({ permission: "granted", endpoint: OLD });
+  const { app, gh } = await boot({ push, state: pushState([hashOf(OLD)]) });
+  assert.deepEqual(push.badges, [3]);
+  await app.wake();
+  await app.click({ act: "tab", tab: "goals" });
+  assert.deepEqual(push.badges, [3], "число то же — значок не трогаем");
+  await app.click({ act: "task", id: taskByText(gh.state, "Записать первый урок").id });
+  assert.deepEqual(push.badges, [3, 2], "своя отметка сразу видна на значке");
+  await app.back();
+  assert.deepEqual(push.badges, [3, 2, 2], "после возврата ставим заново: значок мог поменять пуш");
+
+  const done = JSON.parse(fixtureText).tasks.map((t) => (t.day === TODAY ? { ...t, status: "done" } : t));
+  const cleared = fakePush({ permission: "granted", endpoint: OLD });
+  await boot({ push: cleared, state: { tasks: done, ...pushState([hashOf(OLD)]) } });
+  assert.deepEqual(cleared.badges, [0]);
+});
+
 
 // ---------- сервис-воркер ----------
 
@@ -992,8 +1532,135 @@ test("воркер: сети нет или сервер ответил ошиб�
 });
 
 test("воркер: имя запаса новое, прежний запас удаляется при обновлении", async () => {
-  const worker = startWorker({ oldCaches: ["brain-shell-v1"], fetch: async () => page("новый") });
-  assert.notEqual(worker.cacheName, "brain-shell-v1");
+  const before = ["brain-shell-v1", "brain-shell-v2"];   // запасы прежних выпусков приложения
+  const worker = startWorker({ oldCaches: before, fetch: async () => page("новый") });
+  assert.ok(!before.includes(worker.cacheName), "с напоминаниями оболочка другая — запас под новым именем");
   await worker.activate();
   assert.deepEqual(worker.cacheNames(), [worker.cacheName]);
+});
+
+// ---------- сервис-воркер: напоминания ----------
+
+const APP_URL = "https://example.test/brain-app/";   // где поддельный воркер держит приложение
+const pushed = (notification) => ({ web_push: 8030, notification });
+const MORNING = pushed({
+  title: "План на сегодня", body: "Главная: Записать первый урок. Всего задач: 5. Висят с прошлых дней: 1.",
+  navigate: APP_URL + "?tab=say", app_badge: "3",
+});
+const PLAIN = { title: "Мозг", body: "Открой приложение", icon: "icons/icon-192.png", data: { url: APP_URL + "?tab=say" } };
+
+test("воркер: пуш показывает уведомление с адресом для нажатия и ставит значок", async () => {
+  const worker = startWorker({});
+  await worker.push(MORNING);
+  assert.deepEqual(worker.shown, [{
+    title: "План на сегодня", body: "Главная: Записать первый урок. Всего задач: 5. Висят с прошлых дней: 1.",
+    icon: "icons/icon-192.png", data: { url: APP_URL + "?tab=say" },
+  }]);
+  assert.deepEqual(worker.badges, [3]);
+
+  await worker.push(pushed({ title: "Закроем день?", body: "Сделано 5 из 5. Расскажи, что успел.", navigate: APP_URL + "?tab=say", app_badge: "0" }));
+  assert.deepEqual(worker.shown[1], {
+    title: "Закроем день?", body: "Сделано 5 из 5. Расскажи, что успел.", icon: "icons/icon-192.png", data: { url: APP_URL + "?tab=say" },
+  });
+  assert.deepEqual(worker.badges, [3, 0], "«0» убирает значок");
+
+  // числа для значка нет — значок не трогаем, уведомление показываем
+  await worker.push(pushed({ title: "План на сегодня", body: "На сегодня пока пусто. Скажи, что сегодня главное." }));
+  await worker.push(pushed({ title: "План на сегодня", body: "", app_badge: "много" }));
+  assert.equal(worker.shown.length, 4);
+  assert.deepEqual([worker.shown[2].body, worker.shown[3].body], ["На сегодня пока пусто. Скажи, что сегодня главное.", ""]);
+  assert.deepEqual(worker.badges, [3, 0]);
+});
+
+test("воркер: пуш не разобрался — всё равно показывает простое уведомление", async () => {
+  const broken = ["не json", "{\"notification\":", "", undefined, null, [], 5, { web_push: 8030 }, { notification: "строка" },
+    { notification: null }, { notification: { body: "без заголовка", navigate: APP_URL + "?tab=today", app_badge: "7" } },
+    { notification: { title: 7, body: "заголовок не строка" } }, { notification: { title: "" } }];
+  for (const payload of broken) {
+    const worker = startWorker({});
+    await worker.push(payload);
+    assert.deepEqual(worker.shown, [PLAIN], JSON.stringify(payload) ?? "пуш без данных");
+    assert.deepEqual(worker.badges, [], "значок по непонятному пушу не меняем");
+  }
+});
+
+test("воркер: значков на устройстве нет или значок не поставился — уведомление всё равно показано", async () => {
+  const without = startWorker({ badge: false });
+  await without.push(MORNING);
+  assert.equal(without.shown.length, 1);
+
+  const failing = startWorker({});
+  failing.badgeFails = true;
+  await failing.push(MORNING);
+  assert.equal(failing.shown.length, 1);
+  assert.equal(failing.shown[0].title, "План на сегодня");
+});
+
+test("воркер: уведомление ведёт только внутрь приложения", async () => {
+  const worker = startWorker({});
+  const urlFor = async (navigate) => {
+    await worker.push(pushed({ title: "План на сегодня", body: "", navigate }));
+    return worker.shown[worker.shown.length - 1].data.url;
+  };
+  assert.equal(await urlFor(APP_URL + "?tab=today"), APP_URL + "?tab=today");
+  assert.equal(await urlFor("?tab=review"), APP_URL + "?tab=review", "адрес без сайта — внутри приложения");
+  assert.equal(await urlFor(undefined), APP_URL + "?tab=say");
+  assert.equal(await urlFor(""), APP_URL + "?tab=say");
+  assert.equal(await urlFor(42), APP_URL + "?tab=say");
+  assert.equal(await urlFor("https://evil.example/brain-app/?tab=say"), APP_URL + "?tab=say");
+  assert.equal(await urlFor("https://example.test/another-site/"), APP_URL + "?tab=say", "соседний сайт того же адреса — тоже чужой");
+  assert.equal(await urlFor(APP_URL + "../another-site/"), APP_URL + "?tab=say");
+  assert.equal(await urlFor("javascript:alert(1)"), APP_URL + "?tab=say");
+});
+
+test("воркер: нажатие на уведомление выводит открытое приложение вперёд и просит вкладку «Сказать»", async () => {
+  const neighbour = fakeWindow("https://example.test/another-site/");
+  const mine = fakeWindow(APP_URL + "#review");
+  const worker = startWorker({ windows: [neighbour, mine] });
+  const note = await worker.click({ url: APP_URL + "?tab=say" });
+  assert.equal(note.closed, true);
+  assert.equal(mine.focused, 1);
+  assert.deepEqual(mine.messages, [{ type: "tab", tab: "say" }]);
+  assert.deepEqual(worker.opened, [], "второе окно не открываем");
+  assert.deepEqual([neighbour.focused, neighbour.messages.length], [0, 0], "соседний сайт не трогаем");
+
+  // вкладка берётся из адреса уведомления; адреса нет вовсе (простое уведомление) — «Сказать»
+  await worker.click({ url: APP_URL + "?tab=today" });
+  await worker.click(undefined);
+  await worker.click({ url: "https://evil.example/" });
+  assert.deepEqual(mine.messages.map((m) => m.tab), ["say", "today", "say", "say"]);
+  assert.equal(mine.focused, 4);
+  assert.deepEqual(worker.opened, []);
+});
+
+test("воркер: приложение закрыто — нажатие открывает его по адресу из уведомления", async () => {
+  const worker = startWorker({ windows: [fakeWindow("https://example.test/another-site/")] });
+  const note = await worker.click({ url: APP_URL + "?tab=say" });
+  assert.equal(note.closed, true);
+  assert.deepEqual(worker.opened, [APP_URL + "?tab=say"]);
+  await worker.click(undefined);
+  await worker.click({ url: "https://evil.example/" });
+  assert.deepEqual(worker.opened, [APP_URL + "?tab=say", APP_URL + "?tab=say", APP_URL + "?tab=say"], "чужой адрес не открываем");
+
+  // окно есть, но вывести его вперёд система не дала — открываем заново
+  const stuck = fakeWindow(APP_URL, { focusFails: true });
+  const second = startWorker({ windows: [stuck] });
+  await second.click({ url: APP_URL + "?tab=say" });
+  assert.deepEqual(second.opened, [APP_URL + "?tab=say"]);
+  assert.deepEqual(stuck.messages, [{ type: "tab", tab: "say" }]);
+});
+
+test("воркер: уведомление, собранное по договорённости с ядром, ведёт на «Сказать» настоящего приложения", async () => {
+  const live = "https://toqusif000-ui.github.io/brain-app/";
+  const mine = fakeWindow(live);
+  const worker = startWorker({ base: live, windows: [fakeWindow("https://toqusif000-ui.github.io/"), mine] });
+  await worker.push({ web_push: 8030, notification: { title: "Закроем день?", body: "Задач на сегодня не было. Расскажи, что сделал за день.", navigate: live + "?tab=say", app_badge: "0" } });
+  assert.deepEqual(worker.shown, [{
+    title: "Закроем день?", body: "Задач на сегодня не было. Расскажи, что сделал за день.",
+    icon: "icons/icon-192.png", data: { url: "https://toqusif000-ui.github.io/brain-app/?tab=say" },
+  }]);
+  assert.deepEqual(worker.badges, [0]);
+  await worker.click(worker.shown[0].data);
+  assert.deepEqual(mine.messages, [{ type: "tab", tab: "say" }]);
+  assert.equal(L.startTab(new URL(worker.shown[0].data.url).search, ""), "say", "тот же адрес понимает и само приложение");
 });

@@ -12,6 +12,8 @@
   const WAIT_MS = 3 * 60 * 1000;             // дольше ответа не ждём: «разберу позже»
   const OVERLAY_MAX_MS = 60 * 60 * 1000;     // свою отметку держим поверх сводки не дольше часа
   const OUTBOX_KEEP_MS = 24 * 60 * 60 * 1000;
+  const PUSH_WAIT_MS = 10 * 60 * 1000;       // столько ждём, пока отправленная подписка появится в сводке
+  const TABS = ["today", "goals", "review", "say"];
   const NEXT = { open: "done", done: "fail", fail: "open" };
 
   const pad = (n) => String(n).padStart(2, "0");
@@ -307,10 +309,14 @@
 
   // Что можно забыть: отправленные отметки (дальше они живут в pending), сообщения с пришедшим ответом
   // и очень старые. Неотправленное не трогаем никогда.
+  // Подписка на напоминания (e.push — отпечаток её адреса) ждёт, пока сводка её не покажет, но не дольше
+  // десяти минут: пока она здесь, приложение не подписывается заново.
   function pruneOutbox(outbox, state, nowMs) {
     const answered = new Set(state ? state.replies.map((r) => r.id) : []);
+    const push = pushInfo(state);
     return outbox.filter((e) => {
       if (e.state !== "sent" || !e.dispatched) return true;
+      if (e.push) return !(push && push.endpoints.includes(e.push)) && nowMs - e.sentAt < PUSH_WAIT_MS;
       if (e.file.type !== "text") return false;
       return !answered.has(e.id) && nowMs - e.sentAt < OUTBOX_KEEP_MS;
     });
@@ -452,6 +458,105 @@
     return { days, months: monthTotals(state, days), monthsFromDays: !Array.isArray(state.months), decisions };
   }
 
+  // ---------- напоминания ----------
+
+  // С какой вкладки начать: ?tab=say (так открывает уведомление), иначе #say, иначе «Сегодня».
+  function startTab(search, hash) {
+    let want = null;
+    try { want = new URLSearchParams(String(search || "")).get("tab"); } catch (e) { want = null; }
+    if (!TABS.includes(want)) want = String(hash || "").replace(/^#/, "");
+    return TABS.includes(want) ? want : "today";
+  }
+
+  // Сколько задач на сегодня ещё открыто: это число стоит на значке приложения.
+  const openToday = (state, today) => state.tasks.filter((t) => t.day === today && t.status === "open").length;
+
+  // base64url → байты: в таком виде пуш-сервис принимает открытый ключ сервера.
+  function base64urlToBytes(text) {
+    const A = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+    const s = String(text || "").replace(/=+$/, "");
+    const out = new Uint8Array(Math.floor((s.length * 3) / 4));
+    let acc = 0, bits = 0, n = 0;
+    for (const ch of s) {
+      const v = A.indexOf(ch);
+      if (v < 0) throw new Error("это не base64url");
+      acc = ((acc << 6) | v) & 0xffff;
+      bits += 6;
+      if (bits >= 8) {
+        bits -= 8;
+        out[n++] = (acc >> bits) & 255;
+      }
+    }
+    return out;
+  }
+
+  // Отпечаток подписки: первые 16 шестнадцатеричных знаков SHA-256 от её адреса. По нему приложение узнаёт
+  // свою подписку в сводке (state.push.endpoints); сам адрес в сводку не попадает. subtle — crypto.subtle.
+  async function endpointHash(endpoint, subtle) {
+    const digest = await subtle.digest("SHA-256", new TextEncoder().encode(String(endpoint)));
+    return Array.from(new Uint8Array(digest), (b) => b.toString(16).padStart(2, "0")).join("").slice(0, 16);
+  }
+
+  // Что память знает о подписках: { endpoints: [отпечатки], broken }. null — сводка собрана ядром,
+  // которое о напоминаниях ещё не знает: сверять не с чем.
+  function pushInfo(state) {
+    const p = state && state.push;
+    if (!p || typeof p !== "object" || Array.isArray(p)) return null;
+    return { endpoints: (Array.isArray(p.endpoints) ? p.endpoints : []).map(String), broken: p.broken === true };
+  }
+
+  // Надо ли чинить подписку, когда уведомления разрешены.
+  //   hash    — отпечаток нынешней подписки устройства ("" — подписки нет);
+  //   push    — pushInfo(сводка); waiting — подписка уже лежит в исходящих и ждёт отправки или подтверждения.
+  // "none" — всё в порядке или сверять не с чем; "subscribe" — подписаться и отправить подписку;
+  // "renew" — пуш-сервис сообщил, что подписка умерла: снять её и подписаться заново (иначе вернётся она же).
+  function pushHeal({ permission, hash, push, waiting }) {
+    if (permission !== "granted" || !push || waiting) return "none";
+    if (!hash) return "subscribe";
+    if (push.endpoints.includes(hash)) return "none";
+    return push.broken ? "renew" : "subscribe";
+  }
+
+  // Что показать о напоминаниях вверху «Сегодня».
+  //   installed  — приложение открыто с экрана «Домой» (в обычной вкладке пуши на iPhone не работают);
+  //   supported  — устройство умеет пуши; permission — Notification.permission;
+  //   phase      — что сейчас с включением: "" | "busy" | "enabled" | "failed".
+  // Ответ: { kind, text, button, busy }. button — подпись кнопки ("" — кнопки нет, одна строка текста).
+  function pushNotice({ installed, supported, permission, phase }) {
+    const note = (kind, text, button, busy) => ({ kind, text: text || "", button: button || "", busy: !!busy });
+    if (!installed || !supported) return note("none");
+    if (permission === "denied") {
+      return note("denied", "Напоминания выключены. Разреши уведомления для «Мозг»: Настройки iPhone → Уведомления → Мозг.");
+    }
+    if (phase === "busy") return note("offer", "Включить напоминания в 9:00 и 21:00", "Включаю…", true);
+    if (phase === "failed") return note("failed", "Не получилось включить напоминания.", "Попробовать ещё раз");
+    if (permission === "granted") return phase === "enabled" ? note("enabled", "Напоминания включены.") : note("none");
+    return note("offer", "Включить напоминания в 9:00 и 21:00", "Включить");
+  }
+
+  // Короткое имя устройства по строке браузера: только чтобы отличать подписки друг от друга.
+  function deviceName(userAgent) {
+    const ua = String(userAgent || "");
+    // iPhone и iPad называют себя ещё и «Mac OS X», поэтому они первые
+    for (const [name, mark] of [["iPhone", /iPhone/], ["iPad", /iPad/], ["Android", /Android/],
+      ["Mac", /Macintosh|Mac OS X/], ["Windows", /Windows/], ["Linux", /Linux/]]) {
+      if (mark.test(ua)) return name;
+    }
+    return "Другое";
+  }
+
+  // Операция для входящих из подписки браузера (subscription.toJSON()). null — подписка не по форме.
+  function subscribeOp(sub, device) {
+    const keys = (sub && sub.keys) || {};
+    // ключи — base64url без «=» в конце; если браузер отдал обычный base64, приводим к тому же виду
+    const b64url = (v) => (typeof v === "string" ? v.replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "") : "");
+    const p256dh = b64url(keys.p256dh), auth = b64url(keys.auth);
+    const good = (v) => /^[A-Za-z0-9_-]+$/.test(v);
+    if (!sub || typeof sub.endpoint !== "string" || !/^https:\/\/[^\s/]+\/\S*$/.test(sub.endpoint)) return null;
+    if (!good(p256dh) || !good(auth)) return null;
+    return { op: "push_subscribe", endpoint: sub.endpoint, p256dh, auth, device: String(device || "") };
+  }
+
   // ---------- пробный режим ----------
 
   // Изображает разбор сообщения: отметки меняют задачи и счёт, на текст приходит ответ.
@@ -482,12 +587,14 @@
     offsetOf, dateAt, isoAt,
     fmtDay, fmtDayLong, fmtDayShort, fmtRange, fmtMonth, fmtWhen,
     inboxId, inboxPath, cleanText, textMessage, opsMessage, inboxBody, utf8ToBase64,
-    VERSION: "2026-10-05.2",   // та же строка в app.js
+    VERSION: "2026-10-05.3",   // та же строка в app.js
     validRepo, request, classify, errorText, afterPutError, serialQueue,
     parseState, dayCounts,
     nextStatus, tapTask, takeBatch, markBatchSent, renameBatch, repairPending, overlayState,
     outboxEntry, replyTo, pruneOutbox, isWaiting, buildFeed,
     deriveToday, deriveGoals, deriveReview,
+    TABS, PUSH_WAIT_MS, startTab, openToday,
+    base64urlToBytes, endpointHash, pushInfo, pushHeal, pushNotice, deviceName, subscribeOp,
     mockProcess,
   };
 });

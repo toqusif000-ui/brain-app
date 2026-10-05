@@ -1,11 +1,15 @@
 // Запускает настоящие app.js и sw.js в Node: вместо страницы, часов, памяти устройства и GitHub — подделки.
 // Нужен только там, где поведение не проверить чистой функцией из logic.js. Сам тестов не содержит.
 import vm from "node:vm";
+import { createHash } from "node:crypto";
 import { readFileSync } from "node:fs";
 import L from "../logic.js";
 
 const run = (name, context) =>
   vm.runInContext(readFileSync(new URL("../" + name, import.meta.url), "utf8"), context, { filename: name });
+
+// Настоящий config.js: репозиторий в тестах свой, а ключ напоминаний берём отсюда — тот, с которым приложение живёт.
+const realConfig = run("config.js", vm.createContext({ window: {} })) || {};
 
 // Даёт отработать всем уже готовым продолжениям (цепочкам await) приложения.
 export async function settle() {
@@ -137,10 +141,74 @@ class FakeNode {
   focus() {}
 }
 
+// Что появилось в logic.js вместе с напоминаниями (в прежнем выпуске этого нет).
+export const STAGE2 = ["TABS", "PUSH_WAIT_MS", "startTab", "openToday", "base64urlToBytes", "endpointHash",
+  "pushInfo", "pushHeal", "pushNotice", "deviceName", "subscribeOp"];
+
+// Отпечаток подписки, как его считает ядро: первые 16 шестнадцатеричных знаков SHA-256 от адреса.
+export const hashOf = (endpoint) => createHash("sha256").update(endpoint, "utf8").digest("hex").slice(0, 16);
+
+export const IPHONE = "Mozilla/5.0 (iPhone; CPU iPhone OS 17_4 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Mobile/15E148";
+
+// Уведомления на устройстве: разрешение, подписка в пуш-сервисе, значок на иконке.
+//   permission — что сейчас отвечает Notification.permission;
+//   answer     — что владелец ответит на вопрос о разрешении;
+//   endpoint   — адрес уже существующей подписки ("" — подписки нет).
+export function fakePush({ permission = "default", answer = "granted", endpoint = "" } = {}) {
+  let made = 0;
+  const subscription = (address) => ({
+    endpoint: address,
+    toJSON: () => ({ endpoint: address, expirationTime: null, keys: { p256dh: "BP" + "k".repeat(85), auth: "a".repeat(22) } }),
+    async unsubscribe() {
+      push.log.push("unsubscribe");
+      push.subscription = null;
+      return true;
+    },
+  });
+  const push = {
+    permission,
+    answer,
+    subscription: endpoint ? subscription(endpoint) : null,
+    subscribeFails: false,   // true — пуш-сервис подписку не даёт
+    log: [],                 // по порядку: "ask" (вопрос о разрешении), "subscribe", "unsubscribe"
+    options: [],             // с чем вызывали subscribe
+    badges: [],              // что ставили на значок, по порядку (0 — значок убрали)
+    listeners: {},           // кто слушает сообщения воркера
+    Notification: {
+      get permission() { return push.permission; },
+      requestPermission() {
+        push.log.push("ask");
+        return Promise.resolve().then(() => {
+          if (push.permission === "default") push.permission = push.answer;
+          return push.permission;
+        });
+      },
+    },
+    registration: {
+      pushManager: {
+        getSubscription: async () => push.subscription,
+        async subscribe(options) {
+          push.log.push("subscribe");
+          push.options.push(options);
+          if (push.subscribeFails) throw new Error("NotAllowedError");
+          if (!push.subscription) push.subscription = subscription("https://web.push.apple.com/Q" + (++made));
+          return push.subscription;
+        },
+      },
+    },
+  };
+  return push;
+}
+
 // Открывает приложение. home — установлено на экран «Домой» (display-mode: standalone),
 // ios — то же, но признаком служит navigator.standalone; иначе это обычная вкладка браузера.
+// push — fakePush(): устройство умеет уведомления (без него их на устройстве нет вовсе).
+// search и hash — хвост адреса, с которым приложение открыли (?tab=say, #review).
+// oldLogic — запас отдал logic.js прежнего выпуска: в нём нет ничего, что пришло вместе с напоминаниями.
 // Таймеры сами не срабатывают: опрос и набор отметок тест запускает событиями (wake, pagehide).
-export function startApp({ clock, gh, local, session, home = false, ios = false }) {
+export function startApp({
+  clock, gh, local, session, home = false, ios = false, push = null, search = "", hash = "", userAgent = IPHONE, oldLogic = false,
+}) {
   const nodes = new Map();
   const document = {
     hidden: false,
@@ -161,12 +229,13 @@ export function startApp({ clock, gh, local, session, home = false, ios = false 
   }
   let timerId = 0;
   let salt = 0;
+  let reloads = 0;
   const win = {
     document, console, URLSearchParams, TextEncoder, AbortController,
     Date: FakeDate,
-    BRAIN_CONFIG: { repo: "owner/brain", utcOffsetMinutes: 180 },
-    location: { search: "", hash: "" },
-    navigator: ios ? { onLine: true, standalone: true } : { onLine: true },
+    BRAIN_CONFIG: { repo: "owner/brain", utcOffsetMinutes: 180, vapidPublicKey: realConfig.vapidPublicKey },
+    location: { search, hash, reload() { reloads++; } },
+    navigator: ios ? { onLine: true, standalone: true, userAgent } : { onLine: true, userAgent },
     localStorage: local,
     sessionStorage: session,
     matchMedia: (query) => ({ matches: home && /display-mode:\s*standalone/.test(query) }),
@@ -174,6 +243,13 @@ export function startApp({ clock, gh, local, session, home = false, ios = false 
       getRandomValues(bytes) {
         for (let i = 0; i < bytes.length; i++) bytes[i] = (salt = (salt + 89) % 256);
         return bytes;
+      },
+      // настоящий SHA-256, но без потоков: ответ готов сразу, и settle() его дожидается
+      subtle: {
+        async digest(name, data) {
+          if (name !== "SHA-256") throw new Error("только SHA-256");
+          return new Uint8Array(createHash("sha256").update(data).digest()).buffer;
+        },
       },
     },
     fetch: (url, init) => gh.fetch(url, init),
@@ -183,10 +259,27 @@ export function startApp({ clock, gh, local, session, home = false, ios = false 
     listeners: {},
     addEventListener(type, fn) { (win.listeners[type] ||= []).push(fn); },
   };
+  if (push) {
+    win.Notification = push.Notification;
+    win.PushManager = function PushManager() {};
+    Object.assign(win.navigator, {
+      serviceWorker: {
+        ready: Promise.resolve(push.registration),
+        register: async () => push.registration,
+        addEventListener(type, fn) { (push.listeners[type] ||= []).push(fn); },
+      },
+      async setAppBadge(count) { push.badges.push(count); },
+      async clearAppBadge() { push.badges.push(0); },
+    });
+  }
   win.window = win;
   win.self = win;
   vm.createContext(win);
   run("logic.js", win);
+  if (oldLogic) {
+    for (const name of STAGE2) delete win.BrainLogic[name];
+    win.BrainLogic.VERSION = "2026-10-05.2";
+  }
   run("app.js", win);
 
   const el = (id) => document.getElementById(id);
@@ -198,8 +291,24 @@ export function startApp({ clock, gh, local, session, home = false, ios = false 
     el,
     text: (id) => el(id).textContent,
     screen: () => (el("setup").hidden ? "app" : "setup"),
+    reloads: () => reloads,   // сколько раз приложение перезагрузило страницу
     // нажатие на элемент с такими data-атрибутами: { act: "task", id } или { act: "tab", tab }
     click: (dataset) => emit(document, "click", { target: { closest: () => ({ dataset }) } }),
+    // то же нажатие, но без ожидания: видно, что приложение успело сделать прямо в обработчике
+    press(dataset) {
+      for (const fn of document.listeners.click || []) fn({ target: { closest: () => ({ dataset }) } });
+    },
+    // кнопки внутри блока: [{ act, text, disabled }]
+    buttons(id) {
+      const found = [];
+      const walk = (node) => {
+        if (typeof node === "string") return;
+        if (node.dataset.act) found.push({ act: node.dataset.act, text: node.textContent, disabled: "disabled" in node.attrs });
+        node.kids.forEach(walk);
+      };
+      walk(el(id));
+      return found;
+    },
     // «Отправить» во вкладке «Сказать»; без текста — отправить то, что уже в поле
     say(text) {
       if (text !== undefined) el("say").value = text;
@@ -212,17 +321,48 @@ export function startApp({ clock, gh, local, session, home = false, ios = false 
     },
     wake: () => emit(win, "online"),        // связь вернулась: читаем сводку и досылаем исходящие
     flushTaps: () => emit(win, "pagehide"), // накопленные отметки уходят одним файлом
+    // приложение свернули и снова открыли
+    async back() {
+      document.hidden = true;
+      await emit(document, "visibilitychange");
+      document.hidden = false;
+      await emit(document, "visibilitychange");
+    },
+    // сообщение от воркера (нажали на уведомление при открытом приложении)
+    swMessage: (data) => emit(push, "message", { data }),
   };
+}
+
+// Окно, которое видит воркер. focusFails — вывести его вперёд система не даёт.
+export function fakeWindow(url, { focusFails = false } = {}) {
+  const win = {
+    url,
+    focused: 0,
+    messages: [],
+    async focus() {
+      if (focusFails) throw new Error("InvalidAccessError");
+      win.focused++;
+      return win;
+    },
+    postMessage(message) { win.messages.push(JSON.parse(JSON.stringify(message))); },
+  };
+  return win;
 }
 
 // Запускает sw.js. cached — что уже лежит в запасе: { адрес: ответ }; fetch — подделка сети.
 // Таймеры срабатывают только по fire(), часы идут только через worker.clock.now.
-export function startWorker({ fetch, cached = {}, oldCaches = [] }) {
-  const base = "https://example.test/brain-app/";
+// windows — открытые окна этого же сайта (fakeWindow); badge: false — значков на устройстве нет;
+// base — адрес, по которому лежит приложение.
+export function startWorker({
+  fetch = async () => { throw new TypeError("Failed to fetch"); },
+  cached = {}, oldCaches = [], windows = [], badge = true, base = "https://example.test/brain-app/",
+}) {
   const handlers = {};
   const timers = [];
   const stores = new Map(oldCaches.map((name) => [name, new Map()]));
-  const worker = { putFails: false, timers, base, clock: { now: 1e12 } };
+  // shown — показанные уведомления: { title, body, icon, data }; badges — что ставили на значок (0 — убрали);
+  // opened — адреса, по которым воркер открывал приложение
+  const worker = { putFails: false, timers, base, clock: { now: 1e12 }, shown: [], badges: [], opened: [], badgeFails: false };
   const context = {
     URL,
     Date: { now: () => worker.clock.now },
@@ -230,7 +370,21 @@ export function startWorker({ fetch, cached = {}, oldCaches = [] }) {
       location: new URL("sw.js", base),
       addEventListener(type, fn) { handlers[type] = fn; },
       skipWaiting: async () => {},
-      clients: { claim: async () => {} },
+      clients: {
+        claim: async () => {},
+        matchAll: async () => windows,
+        async openWindow(url) { worker.opened.push(String(url)); },
+      },
+      registration: {
+        async showNotification(title, options) { worker.shown.push(JSON.parse(JSON.stringify({ title, ...options }))); },
+      },
+      navigator: badge ? {
+        async setAppBadge(count) {
+          if (worker.badgeFails) throw new Error("NotAllowedError");
+          worker.badges.push(count);
+        },
+        async clearAppBadge() { worker.badges.push(0); },
+      } : {},
     },
     caches: {
       async open(name) {
@@ -275,6 +429,24 @@ export function startWorker({ fetch, cached = {}, oldCaches = [] }) {
     };
     handlers.fetch(event);
     return event;
+  };
+  // Пуш от сервера. payload: объект (придёт как JSON), строка (как есть), undefined — пуш без данных.
+  worker.push = async (payload) => {
+    const waits = [];
+    const raw = typeof payload === "string" ? payload : JSON.stringify(payload);
+    handlers.push({
+      data: payload === undefined ? null : { text: () => raw, json: () => JSON.parse(raw) },
+      waitUntil: (promise) => waits.push(promise),
+    });
+    await Promise.all(waits);
+  };
+  // Нажатие на уведомление с такими данными. Возвращает уведомление: closed — закрыто ли оно.
+  worker.click = async (data) => {
+    const waits = [];
+    const notification = { data, closed: false, close() { notification.closed = true; } };
+    handlers.notificationclick({ notification, waitUntil: (promise) => waits.push(promise) });
+    await Promise.all(waits);
+    return notification;
   };
   worker.activate = async () => {
     const waits = [];

@@ -31,6 +31,20 @@
           "title": "Рассылка"
         }
       ]
+    },
+    {
+      "id": "personal",
+      "title": "Быт и личное",
+      "topics": [
+        {
+          "id": "tp-7c1d9e",
+          "title": "Дом"
+        },
+        {
+          "id": "tp-e84a02",
+          "title": "Здоровье"
+        }
+      ]
     }
   ],
   "goals": [
@@ -59,6 +73,7 @@
       "days": [
         "2026-09-28"
       ],
+      "time": null,
       "status": "done",
       "created_at": "2026-09-28T09:12:40+03:00",
       "closed_at": "2026-09-28T15:03:10+03:00"
@@ -73,6 +88,7 @@
       "days": [
         "2026-09-28"
       ],
+      "time": null,
       "status": "done",
       "created_at": "2026-09-28T09:12:40+03:00",
       "closed_at": "2026-09-28T19:40:02+03:00"
@@ -88,6 +104,7 @@
         "2026-09-28",
         "2026-09-29"
       ],
+      "time": null,
       "status": "done",
       "created_at": "2026-09-28T09:12:40+03:00",
       "closed_at": "2026-09-29T13:25:31+03:00"
@@ -102,6 +119,7 @@
       "days": [
         "2026-09-29"
       ],
+      "time": null,
       "status": "done",
       "created_at": "2026-09-29T09:05:18+03:00",
       "closed_at": "2026-09-29T11:48:09+03:00"
@@ -116,6 +134,7 @@
       "days": [
         "2026-09-29"
       ],
+      "time": null,
       "status": "fail",
       "created_at": "2026-09-29T09:05:18+03:00",
       "closed_at": "2026-09-29T21:10:44+03:00"
@@ -130,6 +149,7 @@
       "days": [
         "2026-09-30"
       ],
+      "time": null,
       "status": "done",
       "created_at": "2026-09-30T09:20:03+03:00",
       "closed_at": "2026-09-30T17:32:50+03:00"
@@ -144,6 +164,7 @@
       "days": [
         "2026-09-30"
       ],
+      "time": null,
       "status": "done",
       "created_at": "2026-09-30T09:20:03+03:00",
       "closed_at": "2026-09-30T12:06:27+03:00"
@@ -158,6 +179,7 @@
       "days": [
         "2026-10-01"
       ],
+      "time": null,
       "status": "done",
       "created_at": "2026-10-01T09:08:55+03:00",
       "closed_at": "2026-10-01T16:14:36+03:00"
@@ -173,6 +195,7 @@
         "2026-10-01",
         "2026-10-02"
       ],
+      "time": null,
       "status": "done",
       "created_at": "2026-10-01T09:08:55+03:00",
       "closed_at": "2026-10-02T14:51:12+03:00"
@@ -187,6 +210,7 @@
       "days": [
         "2026-10-01"
       ],
+      "time": null,
       "status": "done",
       "created_at": "2026-10-01T09:08:55+03:00",
       "closed_at": "2026-10-01T20:02:41+03:00"
@@ -201,6 +225,7 @@
       "days": [
         "2026-10-02"
       ],
+      "time": null,
       "status": "open",
       "created_at": "2026-10-02T10:15:22+03:00",
       "closed_at": null
@@ -215,6 +240,7 @@
       "days": [
         "2026-10-02"
       ],
+      "time": null,
       "status": "done",
       "created_at": "2026-10-02T10:15:22+03:00",
       "closed_at": "2026-10-02T18:27:05+03:00"
@@ -230,6 +256,7 @@
         "2026-10-03",
         "2026-10-05"
       ],
+      "time": null,
       "status": "open",
       "created_at": "2026-10-03T09:31:17+03:00",
       "closed_at": null
@@ -244,6 +271,7 @@
       "days": [
         "2026-10-03"
       ],
+      "time": null,
       "status": "done",
       "created_at": "2026-10-03T09:31:17+03:00",
       "closed_at": "2026-10-03T12:44:58+03:00"
@@ -258,6 +286,7 @@
       "days": [
         "2026-10-03"
       ],
+      "time": null,
       "status": "fail",
       "created_at": "2026-10-03T09:31:17+03:00",
       "closed_at": "2026-10-03T21:05:33+03:00"
@@ -272,6 +301,7 @@
       "days": [
         "2026-10-05"
       ],
+      "time": null,
       "status": "done",
       "created_at": "2026-10-04T20:16:09+03:00",
       "closed_at": "2026-10-05T10:44:21+03:00"
@@ -286,6 +316,7 @@
       "days": [
         "2026-10-05"
       ],
+      "time": null,
       "status": "open",
       "created_at": "2026-10-04T20:16:09+03:00",
       "closed_at": null
@@ -298,6 +329,7 @@
       "goal": "g-7a6b5c4d",
       "day": null,
       "days": [],
+      "time": null,
       "status": "open",
       "created_at": "2026-10-04T20:16:09+03:00",
       "closed_at": null
@@ -312,6 +344,7 @@
       "days": [
         "2026-10-05"
       ],
+      "time": null,
       "status": "open",
       "created_at": "2026-10-05T09:30:41+03:00",
       "closed_at": null
@@ -326,6 +359,7 @@
       "days": [
         "2026-10-05"
       ],
+      "time": null,
       "status": "done",
       "created_at": "2026-10-05T09:30:41+03:00",
       "closed_at": "2026-10-05T12:17:58+03:00"
@@ -338,6 +372,7 @@
       "goal": null,
       "day": null,
       "days": [],
+      "time": null,
       "status": "open",
       "created_at": "2026-10-01T20:02:41+03:00",
       "closed_at": null
@@ -350,8 +385,99 @@
       "goal": null,
       "day": null,
       "days": [],
+      "time": null,
       "status": "open",
       "created_at": "2026-10-05T12:17:58+03:00",
+      "closed_at": null
+    },
+    {
+      "id": "t-a13f6c58",
+      "text": "Проверить оплату на сайте курса",
+      "area": "course",
+      "topic": "tp-a1b2c3",
+      "goal": null,
+      "day": "2026-10-06",
+      "days": [
+        "2026-10-06"
+      ],
+      "time": null,
+      "status": "open",
+      "created_at": "2026-10-05T09:30:41+03:00",
+      "closed_at": null
+    },
+    {
+      "id": "t-4b7e2a90",
+      "text": "Созвониться с монтажёром",
+      "area": "channel",
+      "topic": "tp-0f1e2d",
+      "goal": null,
+      "day": "2026-10-06",
+      "days": [
+        "2026-10-06"
+      ],
+      "time": "11:00",
+      "status": "open",
+      "created_at": "2026-10-05T09:30:41+03:00",
+      "closed_at": null
+    },
+    {
+      "id": "t-e6052d7b",
+      "text": "Забрать посылку на почте",
+      "area": "personal",
+      "topic": "tp-7c1d9e",
+      "goal": null,
+      "day": "2026-10-06",
+      "days": [
+        "2026-10-06"
+      ],
+      "time": null,
+      "status": "open",
+      "created_at": "2026-10-05T09:30:41+03:00",
+      "closed_at": null
+    },
+    {
+      "id": "t-c5d81e36",
+      "text": "Выложить ролик о том, как устроен курс",
+      "area": "channel",
+      "topic": "tp-0f1e2d",
+      "goal": null,
+      "day": "2026-10-09",
+      "days": [
+        "2026-10-09"
+      ],
+      "time": null,
+      "status": "open",
+      "created_at": "2026-10-05T09:30:41+03:00",
+      "closed_at": null
+    },
+    {
+      "id": "t-29c8b4f1",
+      "text": "Купить продукты на неделю",
+      "area": "personal",
+      "topic": "tp-7c1d9e",
+      "goal": null,
+      "day": "2026-10-09",
+      "days": [
+        "2026-10-09"
+      ],
+      "time": null,
+      "status": "open",
+      "created_at": "2026-10-05T09:30:41+03:00",
+      "closed_at": null
+    },
+    {
+      "id": "t-7f3a905c",
+      "text": "Стоматолог",
+      "area": "personal",
+      "topic": "tp-e84a02",
+      "goal": null,
+      "day": "2026-10-09",
+      "days": [
+        "2026-10-09"
+      ],
+      "time": "15:30",
+      "status": "open",
+      "created_at": "2026-10-05T09:30:41+03:00",
       "closed_at": null
     }
   ],

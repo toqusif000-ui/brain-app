@@ -144,6 +144,8 @@ class FakeNode {
 // Что появилось в logic.js вместе с напоминаниями (в прежнем выпуске этого нет).
 export const STAGE2 = ["TABS", "PUSH_WAIT_MS", "startTab", "openToday", "base64urlToBytes", "endpointHash",
   "pushInfo", "pushHeal", "pushNotice", "deviceName", "subscribeOp"];
+// Что появилось в logic.js вместе с выбором дня во вкладке «Задачи».
+export const DAYS = ["DAYS_BACK", "DAYS_AHEAD", "addDays", "dayStrip", "deriveDay", "tabId"];
 
 // Отпечаток подписки, как его считает ядро: первые 16 шестнадцатеричных знаков SHA-256 от адреса.
 export const hashOf = (endpoint) => createHash("sha256").update(endpoint, "utf8").digest("hex").slice(0, 16);
@@ -204,7 +206,8 @@ export function fakePush({ permission = "default", answer = "granted", endpoint 
 // ios — то же, но признаком служит navigator.standalone; иначе это обычная вкладка браузера.
 // push — fakePush(): устройство умеет уведомления (без него их на устройстве нет вовсе).
 // search и hash — хвост адреса, с которым приложение открыли (?tab=say, #review).
-// oldLogic — запас отдал logic.js прежнего выпуска: в нём нет ничего, что пришло вместе с напоминаниями.
+// oldLogic — запас отдал logic.js прежнего выпуска: "days" — в нём нет выбора дня (выпуск с напоминаниями);
+// true — нет и ничего из того, что пришло вместе с напоминаниями (выпуск до них).
 // Таймеры сами не срабатывают: опрос и набор отметок тест запускает событиями (wake, pagehide).
 export function startApp({
   clock, gh, local, session, home = false, ios = false, push = null, search = "", hash = "", userAgent = IPHONE, oldLogic = false,
@@ -277,8 +280,14 @@ export function startApp({
   vm.createContext(win);
   run("logic.js", win);
   if (oldLogic) {
-    for (const name of STAGE2) delete win.BrainLogic[name];
-    win.BrainLogic.VERSION = "2026-10-05.2";
+    for (const name of oldLogic === "days" ? DAYS : [...STAGE2, ...DAYS]) delete win.BrainLogic[name];
+    // прежний выпуск отдавал «Сегодня» без полей isToday и moved
+    const derive = win.BrainLogic.deriveToday;
+    win.BrainLogic.deriveToday = (...args) => {
+      const { isToday, moved, ...vm } = derive(...args);
+      return vm;
+    };
+    win.BrainLogic.VERSION = oldLogic === "days" ? "2026-10-05.3" : "2026-10-05.2";
   }
   run("app.js", win);
 
@@ -305,6 +314,28 @@ export function startApp({
         if (typeof node === "string") return;
         if (node.dataset.act) found.push({ act: node.dataset.act, text: node.textContent, disabled: "disabled" in node.attrs });
         node.kids.forEach(walk);
+      };
+      walk(el(id));
+      return found;
+    },
+    // сами узлы внутри блока с таким data-act (dataset, attrs, textContent, className)
+    nodes(id, act) {
+      const found = [];
+      const walk = (node) => {
+        if (typeof node === "string") return;
+        if (node.dataset.act === act) found.push(node);
+        node.kids.forEach(walk);
+      };
+      walk(el(id));
+      return found;
+    },
+    // вложенный блок с таким id: его приложение создало само, в разметке страницы его нет
+    inner(id, innerId) {
+      let found = null;
+      const walk = (node) => {
+        if (typeof node === "string" || found) return;
+        if (node.attrs.id === innerId) found = node;
+        else node.kids.forEach(walk);
       };
       walk(el(id));
       return found;

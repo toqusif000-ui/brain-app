@@ -3,7 +3,7 @@
   "use strict";
 
   const L = window.BrainLogic;
-  const VERSION = "2026-10-05.3";   // та же строка в logic.js
+  const VERSION = "2026-10-05.4";   // та же строка в logic.js
   try {
     // При медленной сети запас может отдать app.js и logic.js разных версий. Один раз перезагружаемся:
     // к этому времени запас уже обновился целиком.
@@ -26,6 +26,8 @@
   // Если и после перезагрузки запас отдаёт logic.js прежнего выпуска, того, что пришло вместе
   // с напоминаниями, в нём нет: приложение работает как раньше, без них.
   const OLD_LOGIC = typeof L.pushNotice !== "function";
+  // То же с выбором дня: в прежнем logic.js его нет — тогда «Задачи» показывают только сегодня.
+  const NO_DAYS = typeof L.deriveDay !== "function";
   const TABS = L.TABS || ["today", "goals", "review", "say"];
 
   const $ = (id) => document.getElementById(id);
@@ -105,6 +107,9 @@
   let healed = false;         // подписку сами чиним не больше одного раза за запуск
   let healing = false;
   let badge = -1;             // какое число сейчас стоит на значке приложения (-1 — не знаем)
+  let day = "";               // день, выбранный во вкладке «Задачи»
+  let dayToday = "";          // при каком «сегодня» он выбран: наступил новый день — выбор возвращается к сегодня
+  let aim = "start";          // куда подвинуть полосу дней при отрисовке: "" | "start" | "near" (см. showDay)
   const keep = new Set();     // задачи, отмеченные на открытом экране: не исчезают из-под пальца
   const fold = { hanging: false, backlog: false };
   const painted = new Map();
@@ -614,11 +619,13 @@
 
   // Перерисовываем блок, только если изменилось то, что в нём показано:
   // лишняя перерисовка съедает нажатие, если попадает между касанием и отпусканием.
-  function paint(id, model, build) {
+  // node — сам блок, если приложение создало его само и в разметке его нет. Ответ: перерисовали ли.
+  function paint(id, model, build, node) {
     const sig = JSON.stringify(model);
-    if (painted.get(id) === sig) return;
+    if (painted.get(id) === sig) return false;
     painted.set(id, sig);
-    $(id).replaceChildren(...[build()].flat(Infinity).filter(Boolean));
+    (node || $(id)).replaceChildren(...[build()].flat(Infinity).filter(Boolean));
+    return true;
   }
 
   function setBanner(text, warn) {
@@ -642,8 +649,17 @@
   const taskRow = (t, caption) => el("li", null,
     el("button", { type: "button", class: "task", data: { act: "task", id: t.id, s: t.status } },
       el("span", { class: "box", "aria-hidden": "true" }),
-      el("span", { class: "txt" }, el("span", null, t.text), caption ? el("small", null, caption) : null),
+      el("span", { class: "txt" },
+        el("span", null, t.time ? el("b", { class: "time" }, t.time) : null, t.text),
+        caption ? el("small", null, caption) : null),
       el("span", { class: "sr" }, STATUS[t.status] || "")));
+
+  // Задача, перенесённая с этого дня на другой: видна, но не нажимается.
+  const movedRow = (t) => el("li", null,
+    el("div", { class: "task gone" },
+      el("span", { class: "box", "aria-hidden": "true" }),
+      el("span", { class: "txt" }, el("span", null, t.text),
+        el("small", null, joined("перенесена на " + L.fmtDay(t.day), t.areaTitle, t.topic)))));
 
   const groupCard = (g) => el("section", { class: "card" + (g.done === g.total ? " complete" : "") },
     el("div", { class: "card-head" }, el("h2", null, g.title), el("span", { class: "count" }, `${g.done}/${g.total}`)),
@@ -670,27 +686,69 @@
       el("button", { type: "button", class: "btn primary", data: { act: "push" }, disabled: note.busy }, note.button));
   }
 
-  function renderToday(st, today) {
-    const vm = L.deriveToday(st, today, [...keep]);
-    const note = OLD_LOGIC ? null : L.pushNotice({
+  // Вкладка «Задачи» — два блока: полоса дней и выбранный день. Приложение создаёт их само (в index.html
+  // из запаса их может не быть) и перерисовывает порознь: полоса не должна терять место, до которого её долистали.
+  const daysNode = el("div", { class: "days", id: "days", role: "group", "aria-label": "Дни" });
+  const dayNode = el("div", { id: "day" });
+
+  const dayChip = (c) => el("button", {
+    type: "button", class: "chip", data: { act: "day", date: c.date }, "aria-pressed": String(c.picked),
+    "aria-label": c.open ? `${c.label}, открытых задач: ${c.open}` : null,
+  }, el("span", null, c.label), c.open ? el("span", { class: "count" }, String(c.open)) : null);
+
+  // Двигаем только саму полосу: scrollIntoView сдвинул бы и страницу. "start" — выбранный день встаёт у левого
+  // края, из-за которого выглядывает предыдущий; "near" — полоса сдвигается, только если день виден не целиком.
+  function showDay(how) {
+    const chip = [...daysNode.children].find((c) => c.dataset.date === day);
+    if (!chip) return;
+    const peek = 36;
+    const left = chip.offsetLeft - peek;
+    const right = chip.offsetLeft + chip.offsetWidth + peek - daysNode.clientWidth;
+    if (how === "start" || daysNode.scrollLeft > left) daysNode.scrollLeft = left;
+    else if (daysNode.scrollLeft < right) daysNode.scrollLeft = right;
+  }
+
+  function pickDay(date) {
+    if (!date || date === day) return;
+    day = date;
+    aim = "near";
+    keep.clear();
+    render();
+  }
+
+  function renderTasks(st, today) {
+    const vm = NO_DAYS ? { ...L.deriveToday(st, today, [...keep]), isToday: true, moved: [] }
+      : L.deriveDay(st, day, today, [...keep]);
+    const chips = NO_DAYS ? [] : L.dayStrip(st, today, day);
+    // Главная задача, напоминания, «висят» и «ждут распределения» — только на сегодняшнем дне.
+    const note = OLD_LOGIC || !vm.isToday ? null : L.pushNotice({
       installed: HOME, supported: CAN_PUSH, permission: CAN_PUSH ? permission() : "", phase: pushPhase,
     });
-    paint("tab-today", [vm, note], () => [
-      pushCard(note),
+    paint("tab-today", "days", () => [daysNode, dayNode]);
+    let x = 0;
+    if (paint("days", chips, () => { x = daysNode.scrollLeft; return chips.map(dayChip); }, daysNode)) daysNode.scrollLeft = x;
+    if (aim) showDay(aim);
+    aim = "";
+    paint("day", [vm, note], () => [
       el("div", { class: "total" },
         el("div", { class: "total-label" },
-          el("span", null, "Сделано за день"), el("span", null, `${vm.done} из ${vm.total}`)),
+          el("span", { class: "day-name" }, L.fmtDayLong(vm.date)), el("span", null, `Сделано ${vm.done} из ${vm.total}`)),
         bar(vm.done, vm.total)),
-      el("section", { class: "card main" },
+      pushCard(note),
+      vm.isToday ? el("section", { class: "card main" },
         el("div", { class: "tag" }, "Главная задача дня"),
         vm.main
           ? el("ul", null, taskRow(vm.main, joined(vm.main.areaTitle, vm.main.topic)))
-          : el("p", { class: "empty" }, "Не выбрана. Скажи, какая задача сегодня главная.")),
+          : el("p", { class: "empty" }, "Не выбрана. Скажи, какая задача сегодня главная.")) : null,
       vm.groups.length ? el("div", { class: "grid" }, vm.groups.map(groupCard)) : null,
-      vm.total ? null : el("p", { class: "empty lone" }, "На сегодня задач нет. Расскажи о планах во вкладке «Сказать»."),
+      vm.total || vm.moved.length ? null : el("p", { class: "empty lone" }, "На этот день задач нет. Скажи, что поставить."),
+      vm.moved.length ? el("section", { class: "card moved" },
+        el("div", { class: "card-head" },
+          el("h2", null, "Перенесены на другой день"), el("span", { class: "count" }, String(vm.moved.length))),
+        el("ul", null, vm.moved.map(movedRow))) : null,
       foldBlock("hanging", "Висят с прошлых дней", vm.hanging, (t) => joined(L.fmtDay(t.day), t.areaTitle, t.topic)),
       foldBlock("backlog", "Ждут распределения", vm.backlog, (t) => joined(t.areaTitle, t.topic)),
-    ]);
+    ], dayNode);
   }
 
   const HORIZON = { week: "Цель недели", month: "Цель месяца" };
@@ -783,8 +841,13 @@
     if (screen !== "app") return;
     const st = shown();
     const today = todayIso();
+    if (today !== dayToday) {   // запуск или наступил новый день: выбран снова сегодняшний
+      dayToday = today;
+      day = today;
+      aim = "start";
+    }
     const head = {
-      today: ["Сегодня", L.fmtDayLong(today)],
+      today: ["Задачи", L.fmtDayLong(today)],
       goals: ["Цели", "по сферам"],
       review: ["Обзор", "дни, месяцы, решения"],
       say: ["Сказать", "голосом или текстом"],
@@ -793,7 +856,7 @@
     $("sub").textContent = head[1];
     if (tab === "say") renderSay(st, today);
     else if (!st) paint("tab-" + tab, loaded, () => el("p", { class: "empty lone" }, loaded ? "Сводки пока нет." : "Загружаю сводку…"));
-    else if (tab === "today") renderToday(st, today);
+    else if (tab === "today") renderTasks(st, today);
     else if (tab === "goals") renderGoals(st, today);
     else renderReview(st, today);
     $("foot").textContent = st ? "Сводка от " + L.fmtWhen(st.generated_at, today) : "";
@@ -803,6 +866,7 @@
   function setTab(name) {
     if (!TABS.includes(name)) name = "today";
     if (name !== tab) keep.clear();
+    if (name === "today" && !aim) aim = "start";   // пока вкладка была скрыта, полоса дней могла вернуться к началу
     tab = name;
     for (const t of TABS) $("tab-" + t).hidden = t !== tab;
     for (const b of $("tabs").children) {
@@ -820,6 +884,7 @@
     if (!node) return;
     const act = node.dataset.act;
     if (act === "task") tapTask(node.dataset.id);
+    else if (act === "day") pickDay(node.dataset.date);
     else if (act === "tab") setTab(node.dataset.tab);
     else if (act === "settings") toSetup("");
     else if (act === "back") toApp();
@@ -850,7 +915,7 @@
   $("say").value = String(store.get("draft") || "");
   if (!MOCK && !HOME) $("setupForm").append(el("p", { class: "hint" }, "В обычной вкладке ключ хранится только до её закрытия."));
   setBanner("");
-  // ?tab=say (так открывает уведомление) или #say — открыть сразу нужную вкладку
+  // ?tab=say или ?tab=tasks (так открывает уведомление) или #say — открыть сразу нужную вкладку
   setTab(OLD_LOGIC ? location.hash.slice(1) : L.startTab(location.search, location.hash));
   if (!MOCK && !L.validRepo(REPO)) toSetup("В config.js неверное имя репозитория памяти.");
   else if (!token) toSetup("");
@@ -859,8 +924,13 @@
   if ("serviceWorker" in navigator) {
     window.addEventListener("load", () => { navigator.serviceWorker.register("sw.js").catch(() => {}); });
     // Нажали на уведомление, когда приложение уже открыто: воркер просит показать нужную вкладку.
+    // Уведомление о событии зовёт «Задачи» (tasks) — и речь в нём о сегодняшнем дне: его и показываем.
     navigator.serviceWorker.addEventListener("message", (ev) => {
-      if (ev.data && ev.data.type === "tab" && TABS.includes(ev.data.tab)) setTab(ev.data.tab);
+      if (!ev.data || ev.data.type !== "tab") return;
+      const name = typeof L.tabId === "function" ? L.tabId(ev.data.tab) : ev.data.tab;
+      if (!TABS.includes(name)) return;
+      if (name === "today") dayToday = "";
+      setTab(name);
     });
   }
 })();

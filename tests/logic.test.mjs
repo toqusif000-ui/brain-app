@@ -5,11 +5,13 @@ import assert from "node:assert/strict";
 import vm from "node:vm";
 import { readFileSync } from "node:fs";
 import L from "../logic.js";
-import { FakeStorage, STAGE2, fakeGitHub, fakePush, fakeWindow, hashOf, settle, startApp, startWorker } from "./harness.mjs";
+import { DAYS, FakeStorage, STAGE2, fakeGitHub, fakePush, fakeWindow, hashOf, settle, startApp, startWorker } from "./harness.mjs";
 
 const fixtureText = readFileSync(new URL("../mock/state.json", import.meta.url), "utf8");
 const fixture = () => L.parseState(fixtureText);
-const TODAY = "2026-10-05";
+const TODAY = "2026-10-05";      // понедельник
+const TOMORROW = "2026-10-06";
+const FRIDAY = "2026-10-09";
 const at = (iso) => Date.parse(iso);
 const taskByText = (state, text) => state.tasks.find((t) => t.text === text);
 
@@ -213,7 +215,7 @@ test("разбор сводки", () => {
   assert.deepEqual(bare.replies, []);
   assert.equal(bare.main, null);
   assert.equal(bare.inbox_pending, 0);
-  assert.equal(fixture().tasks.length, 22);
+  assert.equal(fixture().tasks.length, 28);
   assert.deepEqual(L.parseState(fixture()), fixture(), "объект разбирается так же, как строка");
 });
 
@@ -228,8 +230,9 @@ test("пример сводки согласован с описанием да�
   const date = /^\d{4}-\d{2}-\d{2}$/;
   assert.match(s.generated_at, stamp);
 
-  // две сферы с темами
-  assert.equal(s.areas.length, 2);
+  // три сферы с темами: сфер столько, сколько назвала память
+  assert.deepEqual(s.areas.map((a) => [a.id, a.title]),
+    [["course", "Онлайн-курс"], ["channel", "Канал"], ["personal", "Быт и личное"]]);
   const topics = new Set();
   for (const a of s.areas) {
     assert.deepEqual(Object.keys(a), ["id", "title", "topics"]);
@@ -244,7 +247,7 @@ test("пример сводки согласован с описанием да�
   // задачи
   const ids = new Set();
   for (const t of s.tasks) {
-    assert.deepEqual(Object.keys(t), ["id", "text", "area", "topic", "goal", "day", "days", "status", "created_at", "closed_at"]);
+    assert.deepEqual(Object.keys(t), ["id", "text", "area", "topic", "goal", "day", "days", "time", "status", "created_at", "closed_at"]);
     assert.match(t.id, /^t-[0-9a-f]{8}$/);
     assert.ok(!ids.has(t.id), "повтор id " + t.id);
     ids.add(t.id);
@@ -254,6 +257,8 @@ test("пример сводки согласован с описанием да�
     assert.equal(t.day, t.days.length ? t.days[t.days.length - 1] : null, "day — последний из days");
     assert.deepEqual([...t.days].sort(), t.days, "дни по порядку");
     for (const d of t.days) assert.match(d, date);
+    // время — «ЧЧ:ММ» или null; без дня времени не бывает
+    assert.ok(t.time === null || (/^([01]\d|2[0-3]):[0-5]\d$/.test(t.time) && t.day !== null), t.text);
     assert.match(t.created_at, stamp);
     if (t.status === "open") assert.equal(t.closed_at, null);
     else assert.match(t.closed_at, stamp);
@@ -275,10 +280,21 @@ test("пример сводки согласован с описанием да�
   assert.equal(g.done, subs.filter((t) => t.status === "done").length);
   for (const t of s.tasks) assert.ok(t.goal === null || t.goal === g.id);
 
-  // задачи на сегодня в обеих сферах, главная — одна из них
+  // задачи на сегодня в двух сферах, главная — одна из них
   const todays = s.tasks.filter((t) => t.day === TODAY);
-  assert.deepEqual(new Set(todays.map((t) => t.area)), areas);
+  assert.deepEqual(new Set(todays.map((t) => t.area)), new Set(["course", "channel"]));
   assert.ok(todays.some((t) => t.id === s.main));
+  // завтра и в пятницу — по три открытые задачи, у одной из трёх время; в третьей сфере — бытовые дела
+  for (const day of [TOMORROW, FRIDAY]) {
+    const planned = s.tasks.filter((t) => t.day === day);
+    assert.deepEqual(planned.map((t) => t.status), ["open", "open", "open"], day);
+    assert.equal(planned.filter((t) => t.time).length, 1, day);
+  }
+  assert.deepEqual(s.tasks.filter((t) => t.time).map((t) => [t.day, t.time, t.text]),
+    [[TOMORROW, "11:00", "Созвониться с монтажёром"], [FRIDAY, "15:30", "Стоматолог"]]);
+  assert.deepEqual(s.tasks.filter((t) => t.area === "personal").map((t) => t.text),
+    ["Забрать посылку на почте", "Купить продукты на неделю", "Стоматолог"]);
+  assert.ok(s.tasks.every((t) => !t.day || t.day <= FRIDAY));
   // одна висит с прошлого дня, две ждут распределения
   assert.equal(s.tasks.filter((t) => t.status === "open" && t.day && t.day < TODAY).length, 1);
   assert.equal(s.tasks.filter((t) => t.status === "open" && !t.day && !t.goal).length, 2);
@@ -302,8 +318,8 @@ test("пример сводки согласован с описанием да�
     assert.deepEqual(L.dayCounts(s.tasks, d.date),
       { planned: d.planned, done: d.done, fail: d.fail, moved: d.moved, open: d.open });
   }
-  // каждый день, на который что-то запланировано, есть в таблице
-  for (const t of s.tasks) for (const d of t.days) assert.ok(s.days.some((x) => x.date === d), d);
+  // каждый день не позже сегодняшнего, на который что-то запланировано, есть в таблице; будущих дней в ней нет
+  for (const t of s.tasks) for (const d of t.days) assert.equal(s.days.some((x) => x.date === d), d <= TODAY, d);
 
   // одно решение, три ответа
   assert.equal(s.decisions.length, 1);
@@ -347,8 +363,8 @@ test("«Сегодня»: главная, группы по сферам, счё
 test("«Сегодня» на следующий день со вчерашней сводкой", () => {
   const vm = L.deriveToday(fixture(), "2026-10-06", []);
   assert.equal(vm.main, null, "главная назначалась на вчера");
-  assert.equal(vm.total, 0);
-  assert.deepEqual(vm.groups, []);
+  assert.equal(vm.total, 3, "то, что вчера стояло на завтра");
+  assert.deepEqual(vm.groups.map((g) => [g.title, g.done, g.total]), [["Онлайн-курс", 0, 1], ["Канал", 0, 1], ["Быт и личное", 0, 1]]);
   assert.equal(vm.hanging.length, 4, "вчерашние открытые теперь висят");
   assert.deepEqual(vm.hanging.map((t) => t.day), ["2026-10-05", "2026-10-05", "2026-10-05", "2026-10-02"], "свежие сверху");
   assert.ok(vm.hanging.every((t) => t.status === "open"));
@@ -367,7 +383,7 @@ test("отмеченная задача не исчезает из «висят�
 test("«Цели»: сфера → цель → подзадачи, шкала по задачам", () => {
   const state = fixture();
   const vm = L.deriveGoals(state);
-  assert.deepEqual(vm.map((a) => [a.title, a.goals.length]), [["Онлайн-курс", 1], ["Канал", 0]]);
+  assert.deepEqual(vm.map((a) => [a.title, a.goals.length]), [["Онлайн-курс", 1], ["Канал", 0], ["Быт и личное", 0]]);
   const g = vm[0].goals[0];
   assert.equal(g.title, "Записать и выложить первый урок");
   assert.deepEqual([g.done, g.total, g.pct], [1, 3, 33]);
@@ -435,6 +451,236 @@ test("«Обзор»: итоги месяца берутся из сводки, 
   // сводка от прежнего ядра, поля months нет — как раньше, сумма по дням
   assert.equal(fixture().months, undefined);
   assert.deepEqual(L.deriveReview(fixture()).months.map((m) => [m.month, m.planned]), [["2026-10", 14], ["2026-09", 8]]);
+});
+
+// ---------- «Задачи»: полоса дней и выбранный день ----------
+
+test("день через n дней", () => {
+  assert.equal(L.addDays("2026-10-05", 1), "2026-10-06");
+  assert.equal(L.addDays("2026-10-05", 0), "2026-10-05");
+  assert.equal(L.addDays("2026-10-05", -5), "2026-09-30");
+  assert.equal(L.addDays("2026-10-30", 3), "2026-11-02");
+  assert.equal(L.addDays("2026-12-31", 1), "2027-01-01");
+  assert.equal(L.addDays("2028-02-28", 1), "2028-02-29", "високосный год");
+  assert.equal(L.addDays("мусор", 1), "");
+  assert.equal(L.addDays(null, 1), "");
+});
+
+test("полоса дней: от трёх дней назад до двух недель вперёд, подписи и число открытых задач", () => {
+  assert.deepEqual([L.DAYS_BACK, L.DAYS_AHEAD], [3, 14]);
+  const strip = L.dayStrip(fixture(), TODAY, TODAY);
+  assert.deepEqual(Object.keys(strip[0]), ["date", "label", "open", "picked"]);
+  assert.equal(strip.length, 18);
+  assert.equal(strip[0].date, "2026-10-02");
+  assert.equal(strip[3].date, TODAY);
+  assert.equal(strip[17].date, "2026-10-19");
+  assert.deepEqual(strip.map((c) => c.date), Array.from({ length: 18 }, (_, i) => L.addDays("2026-10-02", i)), "каждый день по разу, по порядку");
+  assert.deepEqual(strip.map((c) => c.label), ["пт 2", "сб 3", "Вчера", "Сегодня", "Завтра", "ср 7", "чт 8", "пт 9", "сб 10", "вс 11",
+    "пн 12", "вт 13", "ср 14", "чт 15", "пт 16", "сб 17", "вс 18", "пн 19"]);
+  // число на дне — его открытые задачи; сделанные, несделанные и перенесённые с него в счёт не идут
+  assert.deepEqual(strip.filter((c) => c.open).map((c) => [c.label, c.open]), [["пт 2", 1], ["Сегодня", 3], ["Завтра", 3], ["пт 9", 3]]);
+  assert.deepEqual(strip.filter((c) => c.picked).map((c) => c.date), [TODAY]);
+  assert.deepEqual(L.dayStrip(fixture(), TODAY, FRIDAY).filter((c) => c.picked).map((c) => c.label), ["пт 9"]);
+
+  // своя неподтверждённая отметка сразу меняет число на дне
+  const state = fixture();
+  const call = taskByText(state, "Созвониться с монтажёром");
+  const view = L.overlayState(state, L.tapTask({}, call.id, "open", "open"), 0).state;
+  assert.equal(L.dayStrip(view, TODAY, TODAY).find((c) => c.date === TOMORROW).open, 2);
+
+  // задач нет вовсе — полоса та же, без чисел; «сегодня» непонятно — полосы нет
+  const bare = L.dayStrip({ ...state, tasks: [] }, TODAY, TODAY);
+  assert.deepEqual(bare.map((c) => [c.date, c.open]), strip.map((c) => [c.date, 0]));
+  assert.deepEqual(L.dayStrip(state, "", ""), []);
+});
+
+test("полоса дней: в другом месяце и в другом году к подписи добавляется месяц", () => {
+  const empty = { ...fixture(), tasks: [] };
+  const labels = (today) => L.dayStrip(empty, today, today).map((c) => c.label);
+  // 30 октября 2026 — пятница
+  assert.deepEqual(labels("2026-10-30"), ["вт 27", "ср 28", "Вчера", "Сегодня", "Завтра", "вс 1 нояб", "пн 2 нояб", "вт 3 нояб",
+    "ср 4 нояб", "чт 5 нояб", "пт 6 нояб", "сб 7 нояб", "вс 8 нояб", "пн 9 нояб", "вт 10 нояб", "ср 11 нояб", "чт 12 нояб", "пт 13 нояб"]);
+  // назад через границу; «Вчера» и «Завтра» остаются словами и в чужом месяце
+  assert.deepEqual(labels("2026-11-02").slice(0, 5), ["пт 30 окт", "сб 31 окт", "Вчера", "Сегодня", "Завтра"]);
+  assert.deepEqual(labels("2026-11-01").slice(0, 5), ["чт 29 окт", "пт 30 окт", "Вчера", "Сегодня", "Завтра"]);
+  assert.deepEqual(labels("2026-10-31").slice(2, 6), ["Вчера", "Сегодня", "Завтра", "пн 2 нояб"]);
+  // через Новый год
+  assert.deepEqual(labels("2026-12-30").slice(0, 7), ["вс 27", "пн 28", "Вчера", "Сегодня", "Завтра", "пт 1 янв", "сб 2 янв"]);
+  // тот же месяц другого года — тоже с месяцем, иначе «чт 7» читалось бы как ближайший четверг
+  const base = fixture().tasks[0];
+  const next = { ...empty, tasks: [{ ...base, day: "2027-10-07", days: ["2027-10-07"], status: "open" }] };
+  assert.deepEqual(L.dayStrip(next, TODAY, TODAY).slice(-2).map((c) => c.label), ["пн 19", "чт 7 окт"]);
+  // все двенадцать месяцев
+  const year = { ...empty, tasks: Array.from({ length: 12 }, (_, i) => {
+    const day = `2027-${String(i + 1).padStart(2, "0")}-15`;
+    return { ...base, id: "t-month" + i, day, days: [day], status: "open" };
+  }) };
+  assert.deepEqual(L.dayStrip(year, TODAY, TODAY).slice(18).map((c) => c.label.split(" ")[2]),
+    ["янв", "февр", "мар", "апр", "мая", "июн", "июл", "авг", "сент", "окт", "нояб", "дек"]);
+});
+
+test("полоса дней: более поздний день с задачами встаёт в конец; выбранный день на полосе всегда", () => {
+  const state = fixture();
+  const on = (n, day, status = "open") => ({ ...state.tasks[0], id: "t-far0000" + n, day, days: [day], status, time: null });
+  const more = { ...state, tasks: [...state.tasks,
+    on(1, "2026-11-20"), on(2, "2026-12-01", "done"), on(3, "2026-11-20"), on(4, "2026-10-19"), on(5, "2026-09-20"),
+    { ...on(6, "скоро"), days: [] }, { ...on(7, null), days: [] }] };
+  const strip = L.dayStrip(more, TODAY, TODAY);
+  assert.equal(strip.length, 20, "два дальних дня, каждый по разу");
+  assert.deepEqual(strip.slice(17).map((c) => [c.date, c.label, c.open]), [
+    ["2026-10-19", "пн 19", 1],            // последний день обычной полосы
+    ["2026-11-20", "пт 20 нояб", 2],       // дальше — только дни с задачами, по порядку
+    ["2026-12-01", "вт 1 дек", 0],         // задача на нём уже сделана: день есть, числа нет
+  ]);
+  assert.equal(strip[0].date, "2026-10-02", "день раньше полосы на неё не попадает: его открытые задачи видны в «Висят»");
+  assert.deepEqual(strip.map((c) => c.date), [...strip.map((c) => c.date)].sort());
+
+  // выбранный дальний день остаётся на полосе, даже когда задач на нём уже нет
+  const picked = L.dayStrip(state, TODAY, "2026-11-20");
+  assert.equal(picked.length, 19);
+  assert.deepEqual(picked[18], { date: "2026-11-20", label: "пт 20 нояб", open: 0, picked: true });
+  assert.deepEqual(picked.filter((c) => c.picked).length, 1);
+  // непонятный выбор полосу не ломает
+  const junk = L.dayStrip(state, TODAY, "мусор");
+  assert.equal(junk.length, 18);
+  assert.ok(junk.every((c) => !c.picked));
+});
+
+test("день «Задач»: сегодня — главная, группы, «висят» и «ждут», как раньше", () => {
+  const vm = L.deriveDay(fixture(), TODAY, TODAY, []);
+  assert.deepEqual(Object.keys(vm), ["date", "isToday", "main", "groups", "done", "total", "moved", "hanging", "backlog"]);
+  assert.deepEqual([vm.date, vm.isToday, vm.done, vm.total], [TODAY, true, 2, 5]);
+  assert.equal(vm.main.text, "Записать первый урок");
+  assert.deepEqual(vm.groups.map((g) => [g.title, g.done, g.total]), [["Онлайн-курс", 1, 2], ["Канал", 1, 2]]);
+  assert.ok(!vm.groups.some((g) => g.tasks.some((t) => t.id === vm.main.id)), "главная показана один раз — сверху");
+  assert.deepEqual(vm.hanging.map((t) => t.text), ["Ответить на вопросы под вступительным роликом"]);
+  assert.equal(vm.backlog.length, 2);
+  assert.deepEqual(vm.moved, [], "перенесённые показываем только на прошедшем дне");
+  assert.deepEqual(L.deriveToday(fixture(), TODAY, []), vm, "прежний вопрос «что сегодня» даёт тот же ответ");
+
+  // задача стояла на сегодня и перенесена на завтра: сегодня её в списке нет, а завтра сегодняшний день её покажет
+  const state = fixture();
+  const button = taskByText(state, "Починить кнопку «Записаться» на сайте");
+  const later = { ...state, tasks: state.tasks.map((t) => (t.id === button.id ? { ...t, day: TOMORROW, days: [TODAY, TOMORROW] } : t)) };
+  const now = L.deriveDay(later, TODAY, TODAY, []);
+  assert.deepEqual([now.total, now.moved.length], [4, 0]);
+  assert.deepEqual(L.deriveDay(later, TODAY, TOMORROW, []).moved.map((t) => [t.text, t.day]), [[button.text, TOMORROW]]);
+});
+
+test("день «Задач»: будущий день — задачи по сферам, с временем первыми; ничего сегодняшнего", () => {
+  const vm = L.deriveDay(fixture(), TOMORROW, TODAY, []);
+  assert.deepEqual([vm.date, vm.isToday, vm.main, vm.done, vm.total], [TOMORROW, false, null, 0, 3]);
+  assert.deepEqual(vm.groups.map((g) => [g.title, g.done, g.total, g.tasks.map((t) => [t.time, t.text, t.topic, t.status])]), [
+    ["Онлайн-курс", 0, 1, [["", "Проверить оплату на сайте курса", "Сайт курса", "open"]]],
+    ["Канал", 0, 1, [["11:00", "Созвониться с монтажёром", "Видео", "open"]]],
+    ["Быт и личное", 0, 1, [["", "Забрать посылку на почте", "Дом", "open"]]],
+  ]);
+  assert.deepEqual([vm.moved, vm.hanging, vm.backlog], [[], [], []], "главная, «висят» и «ждут» — только на сегодняшнем дне");
+
+  // пятница: «Стоматолог» в 15:30 стоит в сводке после покупок, а показан первым
+  const friday = L.deriveDay(fixture(), FRIDAY, TODAY, []);
+  assert.deepEqual(friday.groups.map((g) => [g.title, g.tasks.map((t) => [t.time, t.text])]), [
+    ["Канал", [["", "Выложить ролик о том, как устроен курс"]]],
+    ["Быт и личное", [["15:30", "Стоматолог"], ["", "Купить продукты на неделю"]]],
+  ]);
+  assert.deepEqual([friday.done, friday.total], [0, 3]);
+
+  // своя отметка на будущем дне сразу в счёте; id у строки тот же, что у задачи: по нему уходит нажатие
+  const state = fixture();
+  const call = taskByText(state, "Созвониться с монтажёром");
+  const view = L.overlayState(state, L.tapTask({}, call.id, "open", "open"), 0).state;
+  const marked = L.deriveDay(view, TOMORROW, TODAY, []);
+  assert.deepEqual([marked.done, marked.total, marked.groups[1].done], [1, 3, 1]);
+  assert.deepEqual(marked.groups[1].tasks.map((t) => [t.id, t.status]), [[call.id, "done"]]);
+});
+
+test("день «Задач»: прошедший день — что на нём осталось и что с него перенесли", () => {
+  const vm = L.deriveDay(fixture(), "2026-10-03", TODAY, []);
+  assert.deepEqual([vm.isToday, vm.main, vm.done, vm.total], [false, null, 1, 2]);
+  assert.deepEqual(vm.groups.map((g) => [g.title, g.tasks.map((t) => [t.text, t.status])]), [
+    ["Онлайн-курс", [["Проверить сайт с телефона", "done"]]],
+    ["Канал", [["Снять короткий анонс курса", "fail"]]],
+  ]);
+  assert.deepEqual(vm.moved.map((t) => [t.text, t.day, t.areaTitle, t.topic]),
+    [["Смонтировать ролик о том, как устроен курс", TODAY, "Канал", "Видео"]]);
+  assert.ok(!vm.groups.some((g) => g.tasks.some((t) => t.id === vm.moved[0].id)), "перенесённая — отдельно и в счёт дня не идёт");
+  assert.deepEqual([vm.hanging, vm.backlog], [[], []]);
+  // сходится с таблицей «Обзора»: запланировано = осталось на дне + перенесено
+  for (const d of fixture().days) {
+    const day = L.deriveDay(fixture(), d.date, "2026-10-20", []);
+    assert.deepEqual([day.total, day.moved.length, day.done], [d.planned - d.moved, d.moved, d.done], d.date);
+  }
+
+  // открытая задача прошедшего дня — в его списке (и нажимается), с него никто ничего не переносил
+  const friday = L.deriveDay(fixture(), "2026-10-02", TODAY, []);
+  assert.deepEqual([friday.done, friday.total, friday.moved.length], [2, 3, 0]);
+  assert.ok(friday.groups[1].tasks.some((t) => t.text === "Ответить на вопросы под вступительным роликом" && t.status === "open"));
+
+  // задачу сняли с дня совсем (дней у неё больше нет): на прежнем дне её не показываем
+  const state = fixture();
+  const lost = { ...state, tasks: state.tasks.map((t) => (t.day === "2026-10-03" ? { ...t, day: null, days: [] } : t)) };
+  assert.deepEqual([L.deriveDay(lost, "2026-10-03", TODAY, []).total, L.deriveDay(lost, "2026-10-03", TODAY, []).moved.length], [0, 1]);
+});
+
+test("день «Задач»: пустой день", () => {
+  const blank = (date) => ({ date, isToday: false, main: null, groups: [], done: 0, total: 0, moved: [], hanging: [], backlog: [] });
+  assert.deepEqual(L.deriveDay(fixture(), "2026-10-07", TODAY, []), blank("2026-10-07"));
+  assert.deepEqual(L.deriveDay(fixture(), "2026-10-04", TODAY, []), blank("2026-10-04"), "вчера, на котором ничего не стояло");
+  assert.deepEqual(L.deriveDay(fixture(), "2026-11-20", TODAY, []), blank("2026-11-20"));
+  // пустой сегодняшний день: групп нет, а «висят» и «ждут» на месте
+  const next = L.deriveDay(fixture(), "2026-10-07", "2026-10-07", []);
+  assert.deepEqual([next.isToday, next.total, next.groups.length, next.main], [true, 0, 0, null]);
+  assert.equal(next.hanging.length, 7);
+  assert.equal(next.backlog.length, 2);
+});
+
+test("время задачи: с временем — первыми и по времени, остальные в прежнем порядке; не «ЧЧ:ММ» — времени нет", () => {
+  const state = fixture();
+  const base = taskByText(state, "Забрать посылку на почте");
+  const task = (n, time) => ({ ...base, id: "t-0000000" + n, text: "задача " + n, time });
+  const { time: gone, ...old } = task(3, null);   // сводка от ядра, которое о времени ещё не знает
+  const tasks = [task(1, null), task(2, "18:00"), old, task(4, "09:05"), task(5, "9:30"), task(6, "24:00"),
+    task(7, "00:00"), task(8, "12:60"), task(9, ""), task(0, "18:00"), { ...task(1, "15:30:00"), id: "t-0000000a" },
+    { ...task(1, 1530), id: "t-0000000b" }, { ...task(1, "23:59"), id: "t-0000000c" }];
+  const vm = L.deriveDay({ ...state, tasks }, TOMORROW, TODAY, []);
+  assert.equal(vm.groups.length, 1);
+  assert.deepEqual(vm.groups[0].tasks.map((t) => [t.time, t.id]), [
+    ["00:00", "t-00000007"], ["09:05", "t-00000004"], ["18:00", "t-00000002"], ["18:00", "t-00000000"], ["23:59", "t-0000000c"],
+    ["", "t-00000001"], ["", "t-00000003"], ["", "t-00000005"], ["", "t-00000006"], ["", "t-00000008"], ["", "t-00000009"],
+    ["", "t-0000000a"], ["", "t-0000000b"],
+  ]);
+
+  // у главной задачи время тоже видно
+  const main = taskByText(state, "Записать первый урок");
+  const timed = { ...state, tasks: state.tasks.map((t) => (t.id === main.id ? { ...t, time: "10:00" } : t)) };
+  assert.equal(L.deriveDay(timed, TODAY, TODAY, []).main.time, "10:00");
+  assert.equal(L.deriveDay(state, TODAY, TODAY, []).main.time, "");
+  // «висят», «ждут», перенесённые и подзадачи во вкладке «Цели» — как раньше, без времени
+  const vmToday = L.deriveDay(timed, TODAY, TODAY, []);
+  for (const t of [...vmToday.hanging, ...vmToday.backlog, ...L.deriveDay(timed, "2026-10-03", TODAY, []).moved,
+    ...L.deriveGoals(timed)[0].goals[0].tasks]) assert.ok(!("time" in t), t.text);
+});
+
+test("сфер столько, сколько назвала сводка: одна, три или пять, и ещё та, которой в списке нет", () => {
+  const state = fixture();
+  const base = taskByText(state, "Забрать посылку на почте");
+  const areas = ["a", "b", "c", "d", "e"].map((id) => ({ id, title: "Сфера " + id, topics: [] }));
+  const tasks = [...areas, { id: "чужая" }].map((a, i) => ({ ...base, id: "t-0000000" + i, area: a.id, topic: null })).reverse();
+  const five = { ...state, areas, tasks, goals: [], decisions: [], main: null };
+  const titles = ["Сфера a", "Сфера b", "Сфера c", "Сфера d", "Сфера e", "чужая"];
+  assert.deepEqual(L.deriveDay(five, TOMORROW, TODAY, []).groups.map((g) => [g.title, g.total]), titles.map((t) => [t, 1]));
+  assert.deepEqual(L.deriveDay(five, TOMORROW, TOMORROW, []).groups.map((g) => g.title), titles);
+  assert.equal(L.deriveDay(five, TOMORROW, TODAY, []).total, 6);
+  assert.deepEqual(L.deriveGoals(five).map((a) => a.title), titles.slice(0, 5));
+  assert.equal(L.dayStrip(five, TODAY, TODAY).find((c) => c.date === TOMORROW).open, 6);
+
+  const one = { ...five, areas: areas.slice(2, 3), tasks: tasks.filter((t) => t.area === "c") };
+  assert.deepEqual(L.deriveDay(one, TOMORROW, TODAY, []).groups.map((g) => g.title), ["Сфера c"]);
+  assert.deepEqual(L.deriveGoals(one).map((a) => a.title), ["Сфера c"]);
+  assert.deepEqual(L.deriveDay({ ...one, areas: [], tasks: [] }, TOMORROW, TODAY, []).groups, []);
+
+  // три сферы примера: каждая со своими задачами в свой день
+  assert.deepEqual(L.deriveDay(fixture(), TOMORROW, TODAY, []).groups.map((g) => g.id), ["course", "channel", "personal"]);
 });
 
 // ---------- свои отметки ----------
@@ -825,12 +1071,22 @@ test("с какой вкладки начать", () => {
   assert.equal(L.startTab("?tab=settings", "#nope"), "today");
   assert.equal(L.startTab("", ""), "today");
   assert.equal(L.startTab(undefined, undefined), "today");
+
+  // первая вкладка теперь «Задачи»: её зовут и tasks, и по-прежнему today
+  assert.equal(L.startTab("?tab=tasks", ""), "today");
+  assert.equal(L.startTab("?tab=tasks", "#say"), "today", "так открывает уведомление о событии");
+  assert.equal(L.startTab("?mock=1&tab=tasks", ""), "today");
+  assert.equal(L.startTab("", "#tasks"), "today");
+  assert.equal(L.tabId("tasks"), "today");
+  for (const tab of L.TABS) assert.equal(L.tabId(tab), tab);
+  for (const junk of ["чужое", "", "Tasks", "constructor", "__proto__", null, undefined, 5, {}]) assert.equal(L.tabId(junk), "", String(junk));
 });
 
 test("число для значка: открытые задачи на сегодня", () => {
   const state = fixture();
   assert.equal(L.openToday(state, TODAY), 3);
-  assert.equal(L.openToday(state, "2026-10-06"), 0, "висящие с прошлых дней в значок не идут");
+  assert.equal(L.openToday(state, "2026-10-06"), 3);
+  assert.equal(L.openToday(state, "2026-10-07"), 0, "висящие с прошлых дней и задачи будущих дней в значок не идут");
   assert.equal(L.openToday(state, "2026-10-02"), 1);
   // своя неподтверждённая отметка уже учтена
   const task = taskByText(state, "Записать первый урок");
@@ -885,6 +1141,11 @@ async function boot(options = {}) {
   return { app, gh, clock, local, session, disk };
 }
 const queued = (disk) => disk.read("outbox").filter((e) => e.state === "queued");
+// Вкладка «Задачи»: дни на полосе и текст выбранного дня (всё, что под полосой).
+const chips = (app) => app.nodes("tab-today", "day")
+  .map((n) => ({ date: n.dataset.date, text: n.textContent, picked: n.attrs["aria-pressed"] === "true" }));
+const pickedDay = (app) => chips(app).filter((c) => c.picked).map((c) => c.date);
+const dayText = (app) => app.inner("tab-today", "day").textContent;
 
 test("ответ на PUT потерялся, а сообщение уже разобрали: второй раз оно не отправляется", async () => {
   const { app, gh, disk } = await boot();
@@ -1120,7 +1381,7 @@ test("приложение с экрана «Домой»: всё хранитс
 
 // ---------- приложение целиком: вкладка из адреса ----------
 
-test("адрес ?tab=say открывает «Сказать»; #review работает как раньше; без хвоста — «Сегодня»", async () => {
+test("адрес ?tab=say открывает «Сказать»; #review работает как раньше; ?tab=tasks, ?tab=today и адрес без хвоста — «Задачи»", async () => {
   const say = await boot({ search: "?tab=say" });
   assert.equal(say.app.text("title"), "Сказать");
   assert.equal(say.app.el("tab-say").hidden, false);
@@ -1131,9 +1392,13 @@ test("адрес ?tab=say открывает «Сказать»; #review раб�
   assert.equal(review.app.text("title"), "Обзор");
   assert.equal(review.app.el("tab-review").hidden, false);
 
-  const plain = await boot({ search: "?tab=nope" });
-  assert.equal(plain.app.text("title"), "Сегодня");
-  assert.equal(plain.app.el("tab-today").hidden, false);
+  for (const tail of [{ search: "?tab=nope" }, {}, { search: "?tab=tasks" }, { search: "?tab=today" }, { search: "?tab=tasks", hash: "#say" }, { hash: "#tasks" }]) {
+    const { app } = await boot(tail);
+    assert.equal(app.text("title"), "Задачи", JSON.stringify(tail));
+    assert.equal(app.el("tab-today").hidden, false);
+    assert.equal(app.el("tab-say").hidden, true);
+    assert.deepEqual(pickedDay(app), [TODAY], "при запуске выбран сегодняшний день");
+  }
 });
 
 // ---------- приложение целиком: напоминания ----------
@@ -1147,7 +1412,8 @@ const OLD = "https://web.push.apple.com/QOld";   // подписка, котор
 test("напоминания: «Включить» спрашивает разрешение прямо из нажатия, подписывает и шлёт подписку один раз", async () => {
   const push = fakePush();
   const { app, gh, disk, clock } = await boot({ push, state: pushState() });
-  assert.match(app.text("tab-today"), /^Включить напоминания в 9:00 и 21:00 Включить /, "карточка — первой на экране");
+  assert.match(dayText(app), /^понедельник, 5 октября Сделано 2 из 5 Включить напоминания в 9:00 и 21:00 Включить Главная задача дня /,
+    "карточка — сразу под днём, выше задач");
   assert.deepEqual(pushButtons(app), [{ act: "push", text: "Включить", disabled: false }]);
   assert.deepEqual(push.log, [], "пока не нажали — ничего не спрашиваем и не подписываем");
   assert.deepEqual(gh.accepted, []);
@@ -1173,7 +1439,7 @@ test("напоминания: «Включить» спрашивает разр
     id, sent_at: "2026-10-05T12:20:00+03:00", channel: "phone", type: "ops",
     ops: [{ op: "push_subscribe", endpoint: Q1, p256dh: "BP" + "k".repeat(85), auth: "a".repeat(22), device: "iPhone" }],
   });
-  assert.match(app.text("tab-today"), /^Напоминания включены\. /);
+  assert.match(dayText(app), / Сделано 2 из 5 Напоминания включены\. Главная задача дня /);
   assert.deepEqual(pushButtons(app), []);
 
   // пока память не подтвердила подписку, её не дублируют ни нажатие, ни опрос, ни возврат в приложение
@@ -1202,7 +1468,7 @@ test("напоминания: на вопрос ответили «не разр
   app.press({ act: "push" });
   await settle();
   assert.deepEqual(push.log, ["ask"], "подписываться без разрешения не пробуем");
-  assert.match(app.text("tab-today"), /^Напоминания выключены\. Разреши уведомления для «Мозг»: Настройки iPhone → Уведомления → Мозг\. /);
+  assert.match(dayText(app), / Сделано 2 из 5 Напоминания выключены\. Разреши уведомления для «Мозг»: Настройки iPhone → Уведомления → Мозг\. Главная задача дня /);
   assert.deepEqual(pushButtons(app), [], "кнопки нет: спросить второй раз приложение не может");
   await app.wake();
   await app.back();
@@ -1233,14 +1499,14 @@ test("напоминания: подписаться не вышло — об э
   const { app, gh } = await boot({ push, state: pushState() });
   app.press({ act: "push" });
   await settle();
-  assert.match(app.text("tab-today"), /^Не получилось включить напоминания\. Попробовать ещё раз /);
+  assert.match(dayText(app), / Сделано 2 из 5 Не получилось включить напоминания\. Попробовать ещё раз Главная задача дня /);
   assert.deepEqual(pushButtons(app), [{ act: "push", text: "Попробовать ещё раз", disabled: false }]);
   assert.deepEqual(gh.accepted, []);
 
   push.subscribeFails = false;
   app.press({ act: "push" });
   await settle();
-  assert.match(app.text("tab-today"), /^Напоминания включены\. /);
+  assert.match(dayText(app), / Сделано 2 из 5 Напоминания включены\. Главная задача дня /);
   assert.deepEqual(subscribeOps(gh).map((op) => [op.op, op.endpoint]), [["push_subscribe", Q1]]);
 });
 
@@ -1384,7 +1650,9 @@ test("запас отдал новый app.js со старым logic.js: одн
   assert.equal(app.screen(), "app");
   assert.equal(app.text("title"), "Сказать", "вкладка — как раньше, из #");
   await app.click({ act: "tab", tab: "today" });
-  assert.match(app.text("tab-today"), /^Сделано за день 2 из 5 /);
+  assert.equal(app.text("title"), "Задачи");
+  assert.match(app.text("tab-today"), /^понедельник, 5 октября Сделано 2 из 5 Главная задача дня Записать первый урок /);
+  assert.deepEqual(chips(app), [], "выбора дня в прежнем logic.js нет: показываем сегодня");
   assert.deepEqual(pushButtons(app), []);
   await app.click({ act: "task", id: taskByText(gh.state, "Записать первый урок").id });
   await app.flushTaps();
@@ -1407,7 +1675,7 @@ test("приложение с экрана «Домой» на устройст�
 test("воркер просит вкладку (нажали на уведомление при открытом приложении) — приложение её показывает", async () => {
   const push = fakePush({ permission: "granted", endpoint: OLD });
   const { app, gh } = await boot({ push, state: pushState([hashOf(OLD)]) });
-  assert.equal(app.text("title"), "Сегодня");
+  assert.equal(app.text("title"), "Задачи");
   await app.swMessage({ type: "tab", tab: "say" });
   assert.equal(app.text("title"), "Сказать");
   assert.equal(app.el("tab-say").hidden, false);
@@ -1417,7 +1685,17 @@ test("воркер просит вкладку (нажали на уведомл
     assert.equal(app.text("title"), "Сказать", "непонятное сообщение ничего не меняет");
   }
   await app.swMessage({ type: "tab", tab: "today" });
-  assert.equal(app.text("title"), "Сегодня");
+  assert.equal(app.text("title"), "Задачи");
+  assert.equal(app.el("tab-today").hidden, false);
+
+  // уведомление о событии зовёт tasks: это та же вкладка, и показывает она сегодняшний день
+  await app.click({ act: "day", date: FRIDAY });
+  await app.click({ act: "tab", tab: "say" });
+  await app.swMessage({ type: "tab", tab: "tasks" });
+  assert.equal(app.text("title"), "Задачи");
+  assert.equal(app.el("tab-today").hidden, false);
+  assert.equal(app.el("tab-say").hidden, true);
+  assert.deepEqual(pickedDay(app), [TODAY]);
   assert.deepEqual(gh.accepted, []);
 });
 
@@ -1437,6 +1715,224 @@ test("значок приложения: открытые задачи на се
   const cleared = fakePush({ permission: "granted", endpoint: OLD });
   await boot({ push: cleared, state: { tasks: done, ...pushState([hashOf(OLD)]) } });
   assert.deepEqual(cleared.badges, [0]);
+});
+
+// ---------- приложение целиком: «Задачи» по дням ----------
+
+const taskIds = (app) => app.nodes("tab-today", "task").map((n) => n.dataset.id);
+
+test("«Задачи»: полоса дней; нажатие на день показывает его задачи", async () => {
+  const { app, gh } = await boot();
+  assert.equal(app.text("title"), "Задачи");
+  assert.equal(app.text("sub"), "понедельник, 5 октября");
+  const strip = chips(app);
+  assert.equal(strip.length, 18);
+  assert.deepEqual(strip.slice(0, 9).map((c) => c.text), ["пт 2 1", "сб 3", "Вчера", "Сегодня 3", "Завтра 3", "ср 7", "чт 8", "пт 9 3", "сб 10"]);
+  assert.deepEqual(pickedDay(app), [TODAY], "при запуске выбран сегодняшний день");
+  assert.ok(app.text("tab-today").startsWith("пт 2 1 сб 3 Вчера Сегодня 3 Завтра 3 "), "полоса — вверху вкладки");
+  assert.match(dayText(app), /^понедельник, 5 октября Сделано 2 из 5 Главная задача дня Записать первый урок Онлайн-курс · Уроки открыта Онлайн-курс 1\/2 /);
+  assert.match(dayText(app), / Висят с прошлых дней 1 .* Ждут распределения 2 /);
+  assert.equal(taskIds(app).length, 8, "главная, четыре в группах, одна висит, две ждут");
+
+  // завтра: задачи трёх сфер с темой под каждой; у задачи с временем оно стоит перед текстом
+  await app.click({ act: "day", date: TOMORROW });
+  assert.deepEqual(pickedDay(app), [TOMORROW]);
+  assert.equal(dayText(app), "вторник, 6 октября Сделано 0 из 3 " +
+    "Онлайн-курс 0/1 Проверить оплату на сайте курса Сайт курса открыта " +
+    "Канал 0/1 11:00 Созвониться с монтажёром Видео открыта " +
+    "Быт и личное 0/1 Забрать посылку на почте Дом открыта");
+  assert.equal(taskIds(app).length, 3);
+  assert.equal(app.text("title"), "Задачи");
+  assert.equal(app.text("sub"), "понедельник, 5 октября", "в шапке по-прежнему сегодняшний день");
+
+  // пятница: событие в 15:30 — первым в своей сфере
+  await app.click({ act: "day", date: FRIDAY });
+  assert.deepEqual(pickedDay(app), [FRIDAY]);
+  assert.equal(dayText(app), "пятница, 9 октября Сделано 0 из 3 " +
+    "Канал 0/1 Выложить ролик о том, как устроен курс Видео открыта " +
+    "Быт и личное 0/2 15:30 Стоматолог Здоровье открыта Купить продукты на неделю Дом открыта");
+
+  // пустой день
+  await app.click({ act: "day", date: "2026-10-07" });
+  assert.equal(dayText(app), "среда, 7 октября Сделано 0 из 0 На этот день задач нет. Скажи, что поставить.");
+  assert.deepEqual(taskIds(app), []);
+
+  // прошедший день: что на нём осталось — нажимается; перенесённая с него видна, но не нажимается
+  await app.click({ act: "day", date: "2026-10-03" });
+  assert.equal(dayText(app), "суббота, 3 октября Сделано 1 из 2 " +
+    "Онлайн-курс 1/1 Проверить сайт с телефона Сайт курса сделана " +
+    "Канал 0/1 Снять короткий анонс курса Видео не сделана " +
+    "Перенесены на другой день 1 Смонтировать ролик о том, как устроен курс перенесена на 5 октября · Канал · Видео");
+  assert.deepEqual(taskIds(app), [taskByText(gh.state, "Проверить сайт с телефона").id, taskByText(gh.state, "Снять короткий анонс курса").id]);
+
+  // главная задача, «висят» и «ждут» — только на сегодняшнем дне
+  for (const date of [TOMORROW, FRIDAY, "2026-10-07", "2026-10-03", "2026-10-04"]) {
+    await app.click({ act: "day", date });
+    assert.doesNotMatch(dayText(app), /Главная задача дня|Висят с прошлых дней|Ждут распределения/, date);
+  }
+  await app.click({ act: "day", date: TODAY });
+  assert.deepEqual(pickedDay(app), [TODAY]);
+  assert.match(dayText(app), /^понедельник, 5 октября Сделано 2 из 5 Главная задача дня /);
+  assert.match(dayText(app), / Висят с прошлых дней 1 .* Ждут распределения 2 /);
+  assert.equal(chips(app).length, 18, "от выбора дня полоса не меняется");
+  assert.deepEqual(gh.accepted, [], "выбор дня никуда не отправляется");
+});
+
+test("«Задачи»: нажатие на задачу другого дня уходит тем же файлом нажатий, что и раньше", async () => {
+  const push = fakePush({ permission: "granted", endpoint: OLD });
+  const { app, gh, disk } = await boot({ push, state: pushState([hashOf(OLD)]) });
+  const call = taskByText(gh.state, "Созвониться с монтажёром");
+  const mark = gh.log.length;
+  await app.click({ act: "day", date: TOMORROW });
+  await app.click({ act: "task", id: call.id });   // открыта → сделана
+  // видно сразу: в строке, в счёте дня и в числе на полосе
+  assert.match(dayText(app), /^вторник, 6 октября Сделано 1 из 3 .* Канал 1\/1 11:00 Созвониться с монтажёром Видео сделана /);
+  assert.deepEqual(chips(app).slice(3, 5).map((c) => c.text), ["Сегодня 3", "Завтра 2"]);
+  assert.deepEqual(push.badges, [3], "значок приложения по-прежнему про сегодня");
+  assert.deepEqual(gh.accepted, [], "отметки копятся");
+
+  await app.flushTaps();
+  const [id] = gh.accepted;
+  assert.deepEqual(gh.log.slice(mark), ["PUT " + id, "POST dispatches"]);
+  assert.deepEqual(gh.files.get(id), {
+    id, sent_at: "2026-10-05T12:20:00+03:00", channel: "phone", type: "ops",
+    ops: [{ op: "set_status", id: call.id, status: "done" }],
+  });
+  assert.equal(disk.read("pending")[call.id].batch, id);
+
+  // тот же круг из трёх состояний; два нажатия подряд уходят одним файлом
+  await app.click({ act: "task", id: call.id });   // сделана → не сделана
+  assert.match(dayText(app), /11:00 Созвониться с монтажёром Видео не сделана /);
+  await app.click({ act: "task", id: call.id });   // не сделана → открыта
+  assert.match(dayText(app), /11:00 Созвониться с монтажёром Видео открыта /);
+  assert.equal(chips(app)[4].text, "Завтра 3");
+  await app.flushTaps();
+  assert.equal(gh.accepted.length, 2);
+  assert.deepEqual(gh.files.get(gh.accepted[1]).ops, [{ op: "set_status", id: call.id, status: "open" }]);
+
+  // задача сегодняшнего дня уходит точно таким же файлом
+  const today = await boot();
+  const lesson = taskByText(today.gh.state, "Записать первый урок");
+  await today.app.click({ act: "task", id: lesson.id });
+  await today.app.flushTaps();
+  const twin = today.gh.files.get(today.gh.accepted[0]);
+  assert.deepEqual(twin, { ...gh.files.get(id), ops: [{ op: "set_status", id: lesson.id, status: "done" }] });
+});
+
+test("«Задачи»: прошедший день — открытая задача нажимается, перенесённая с него нет", async () => {
+  const { app, gh } = await boot();
+  await app.click({ act: "day", date: "2026-10-02" });
+  const hang = taskByText(gh.state, "Ответить на вопросы под вступительным роликом");
+  assert.equal(chips(app)[0].text, "пт 2 1");
+  await app.click({ act: "task", id: hang.id });
+  assert.match(dayText(app), /^пятница, 2 октября Сделано 3 из 3 /);
+  assert.equal(chips(app)[0].text, "пт 2");
+  await app.flushTaps();
+  assert.deepEqual(gh.files.get(gh.accepted[0]).ops, [{ op: "set_status", id: hang.id, status: "done" }]);
+
+  await app.click({ act: "day", date: "2026-10-03" });
+  const gone = app.inner("tab-today", "day").textContent;
+  assert.match(gone, /Смонтировать ролик о том, как устроен курс перенесена на 5 октября/);
+  assert.ok(!taskIds(app).includes(taskByText(gh.state, "Смонтировать ролик о том, как устроен курс").id));
+  assert.equal(gh.accepted.length, 1);
+});
+
+test("«Задачи»: выбор дня держится, пока идёт тот же день; наступил новый — выбран снова сегодняшний", async () => {
+  const { app, gh, clock, local, session } = await boot();
+  await app.click({ act: "day", date: FRIDAY });
+  await app.back();                               // свернули и открыли в тот же день
+  await app.wake();
+  assert.deepEqual(pickedDay(app), [FRIDAY]);
+  await app.click({ act: "tab", tab: "goals" });   // сходили на другую вкладку
+  await app.click({ act: "tab", tab: "today" });
+  assert.deepEqual(pickedDay(app), [FRIDAY]);
+  assert.match(dayText(app), /^пятница, 9 октября /);
+
+  clock.now = at("2026-10-06T00:00:30+03:00");     // полночь прошла, приложение открыли снова
+  await app.back();
+  assert.deepEqual(pickedDay(app), [TOMORROW], "новый день — выбран он");
+  assert.equal(app.text("sub"), "вторник, 6 октября");
+  const strip = chips(app);
+  assert.deepEqual([strip[0].date, strip[17].date], ["2026-10-03", "2026-10-20"], "полоса сдвинулась на день");
+  assert.deepEqual(strip.slice(2, 5).map((c) => c.text), ["Вчера 3", "Сегодня 3", "Завтра"]);
+  // сводка ещё вчерашняя: главной на новый день нет, вчерашние открытые висят
+  assert.match(dayText(app), /^вторник, 6 октября Сделано 0 из 3 Главная задача дня Не выбрана\. Скажи, какая задача сегодня главная\. /);
+  assert.match(dayText(app), / Висят с прошлых дней 4 /);
+
+  // новый запуск приложения — снова сегодня, что бы ни было выбрано раньше
+  await app.click({ act: "day", date: FRIDAY });
+  const again = await boot({ clock, gh, local, session });
+  assert.deepEqual(pickedDay(again.app), [TOMORROW]);
+});
+
+test("«Задачи»: карточка напоминаний — только на сегодняшнем дне", async () => {
+  const push = fakePush();
+  const { app } = await boot({ push, state: pushState() });
+  assert.deepEqual(pushButtons(app), [{ act: "push", text: "Включить", disabled: false }]);
+  await app.click({ act: "day", date: TOMORROW });
+  assert.deepEqual(pushButtons(app), []);
+  assert.doesNotMatch(app.text("tab-today"), /апоминани/);
+  await app.click({ act: "day", date: TODAY });
+  assert.deepEqual(pushButtons(app), [{ act: "push", text: "Включить", disabled: false }]);
+  assert.deepEqual(push.log, []);
+});
+
+test("«Задачи»: сводки сначала нет, потом она пришла — полоса и день на месте", async () => {
+  const clock = { now: at("2026-10-05T12:20:00+03:00") };
+  const gh = fakeGitHub(clock, null);
+  const { app } = await boot({ gh, clock });
+  assert.equal(app.text("tab-today"), "Сводки пока нет.");
+  assert.deepEqual(chips(app), []);
+  gh.state = JSON.parse(fixtureText);
+  await app.wake();
+  assert.equal(chips(app).length, 18);
+  assert.deepEqual(pickedDay(app), [TODAY]);
+  assert.match(dayText(app), /^понедельник, 5 октября Сделано 2 из 5 /);
+  assert.doesNotMatch(app.text("tab-today"), /Сводки пока нет/);
+});
+
+test("«Задачи»: сводка от ядра, которое о времени и третьей сфере ещё не знает, показывается как раньше", async () => {
+  const old = JSON.parse(fixtureText);
+  old.areas = old.areas.filter((a) => a.id !== "personal");
+  old.tasks = old.tasks.filter((t) => t.area !== "personal").map(({ time, ...t }) => t);
+  const { app } = await boot({ state: old });
+  assert.match(dayText(app), /^понедельник, 5 октября Сделано 2 из 5 Главная задача дня Записать первый урок /);
+  await app.click({ act: "day", date: TOMORROW });
+  assert.equal(dayText(app), "вторник, 6 октября Сделано 0 из 2 " +
+    "Онлайн-курс 0/1 Проверить оплату на сайте курса Сайт курса открыта " +
+    "Канал 0/1 Созвониться с монтажёром Видео открыта");
+});
+
+test("запас отдал новый app.js с logic.js прошлого выпуска (без выбора дня): «Задачи» показывают сегодня, остальное работает", async () => {
+  for (const name of DAYS) assert.ok(name in L, name + " — есть в нынешнем logic.js");
+  const push = fakePush({ permission: "granted", endpoint: OLD });
+  const session = new FakeStorage();
+  const first = await boot({ push, session, oldLogic: "days", state: pushState() });
+  assert.equal(first.app.reloads(), 1, "версии разошлись — одна перезагрузка");
+  assert.deepEqual(first.gh.log, []);
+
+  const { clock, gh, local } = first;
+  const { app } = await boot({ push, session, clock, gh, local, oldLogic: "days", search: "?tab=tasks" });
+  assert.equal(app.reloads(), 0, "по кругу не перезагружаемся");
+  assert.equal(app.text("title"), "Задачи");
+  assert.equal(app.el("tab-today").hidden, false);
+  assert.deepEqual(chips(app), [], "полосы дней нет");
+  assert.match(app.text("tab-today"), /^понедельник, 5 октября Сделано 2 из 5 Главная задача дня Записать первый урок /);
+  assert.match(app.text("tab-today"), / Висят с прошлых дней 1 .* Ждут распределения 2 /);
+  // напоминания в том выпуске уже были: подписка чинится, значок ставится
+  assert.deepEqual(push.log, ["subscribe"]);
+  assert.deepEqual(push.badges, [3]);
+  await app.click({ act: "task", id: taskByText(gh.state, "Записать первый урок").id });
+  await app.flushTaps();
+  await app.say("купить домен");
+  assert.deepEqual(gh.accepted.map((id) => gh.files.get(id).type), ["ops", "ops", "text"], "подписка, отметка и сообщение ушли");
+  assert.deepEqual(push.badges, [3, 2]);
+  // воркер зовёт вкладку по-старому — работает; по новому имени прежний logic.js её не знает, и ничего не ломается
+  await app.swMessage({ type: "tab", tab: "say" });
+  await app.swMessage({ type: "tab", tab: "tasks" });
+  assert.equal(app.text("title"), "Сказать");
+  await app.swMessage({ type: "tab", tab: "today" });
+  assert.equal(app.text("title"), "Задачи");
 });
 
 
@@ -1532,9 +2028,9 @@ test("воркер: сети нет или сервер ответил ошиб�
 });
 
 test("воркер: имя запаса новое, прежний запас удаляется при обновлении", async () => {
-  const before = ["brain-shell-v1", "brain-shell-v2"];   // запасы прежних выпусков приложения
+  const before = ["brain-shell-v1", "brain-shell-v2", "brain-shell-v3"];   // запасы прежних выпусков приложения
   const worker = startWorker({ oldCaches: before, fetch: async () => page("новый") });
-  assert.ok(!before.includes(worker.cacheName), "с напоминаниями оболочка другая — запас под новым именем");
+  assert.ok(!before.includes(worker.cacheName), "оболочка другая — запас под новым именем, иначе установленное приложение не обновится");
   await worker.activate();
   assert.deepEqual(worker.cacheNames(), [worker.cacheName]);
 });
@@ -1663,4 +2159,28 @@ test("воркер: уведомление, собранное по догово
   await worker.click(worker.shown[0].data);
   assert.deepEqual(mine.messages, [{ type: "tab", tab: "say" }]);
   assert.equal(L.startTab(new URL(worker.shown[0].data.url).search, ""), "say", "тот же адрес понимает и само приложение");
+});
+
+test("воркер: уведомление о событии ведёт на «Задачи» — и в открытом приложении, и в закрытом", async () => {
+  const live = "https://toqusif000-ui.github.io/brain-app/";
+  const event = { web_push: 8030, notification: { title: "Скоро: Стоматолог", body: "Сегодня в 15:30.", navigate: live + "?tab=tasks", app_badge: "3" } };
+  const mine = fakeWindow(live + "?tab=say");
+  const worker = startWorker({ base: live, windows: [mine] });
+  await worker.push(event);
+  assert.deepEqual(worker.shown, [{
+    title: "Скоро: Стоматолог", body: "Сегодня в 15:30.", icon: "icons/icon-192.png",
+    data: { url: "https://toqusif000-ui.github.io/brain-app/?tab=tasks" },
+  }]);
+  assert.deepEqual(worker.badges, [3]);
+  await worker.click(worker.shown[0].data);
+  assert.deepEqual(mine.messages, [{ type: "tab", tab: "tasks" }]);
+  assert.equal(mine.focused, 1);
+  assert.deepEqual(worker.opened, []);
+
+  const closed = startWorker({ base: live });
+  await closed.push(event);
+  await closed.click(closed.shown[0].data);
+  assert.deepEqual(closed.opened, [live + "?tab=tasks"]);
+  assert.equal(L.startTab(new URL(closed.opened[0]).search, ""), "today", "этот адрес приложение открывает на «Задачах»");
+  assert.equal(L.tabId(mine.messages[0].tab), "today", "и эту просьбу воркера понимает так же");
 });

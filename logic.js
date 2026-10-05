@@ -13,7 +13,11 @@
   const OVERLAY_MAX_MS = 60 * 60 * 1000;     // свою отметку держим поверх сводки не дольше часа
   const OUTBOX_KEEP_MS = 24 * 60 * 60 * 1000;
   const PUSH_WAIT_MS = 10 * 60 * 1000;       // столько ждём, пока отправленная подписка появится в сводке
+  // Первая вкладка — «Задачи» с выбором дня. В разметке и в адресах прежних уведомлений она зовётся today;
+  // tasks — то же самое под новым именем (?tab=tasks, сообщение воркера).
   const TABS = ["today", "goals", "review", "say"];
+  const DAYS_BACK = 3;                      // полоса дней: столько дней назад
+  const DAYS_AHEAD = 14;                     // и столько вперёд
   const NEXT = { open: "done", done: "fail", fail: "open" };
 
   const pad = (n) => String(n).padStart(2, "0");
@@ -48,6 +52,8 @@
   const MONTHS_SHORT = ["янв", "фев", "мар", "апр", "мая", "июн", "июл", "авг", "сен", "окт", "ноя", "дек"];
   const WEEKDAYS = ["воскресенье", "понедельник", "вторник", "среда", "четверг", "пятница", "суббота"];
   const WEEKDAYS_SHORT = ["вс", "пн", "вт", "ср", "чт", "пт", "сб"];
+  // месяц на полосе дней: «вс 1 нояб»
+  const MONTHS_CHIP = ["янв", "февр", "мар", "апр", "мая", "июн", "июл", "авг", "сент", "окт", "нояб", "дек"];
 
   function parts(iso) {
     const m = /^(\d{4})-(\d{2})-(\d{2})/.exec(String(iso || ""));
@@ -55,6 +61,12 @@
     return { y: Number(m[1]), m: Number(m[2]), d: Number(m[3]) };
   }
   const weekday = (p) => new Date(Date.UTC(p.y, p.m - 1, p.d)).getUTCDay();
+
+  // День через n дней: ("2026-10-30", 3) → "2026-11-02". Непонятная дата — пустая строка.
+  function addDays(iso, n) {
+    const p = parts(iso);
+    return p ? new Date(Date.UTC(p.y, p.m - 1, p.d + n)).toISOString().slice(0, 10) : "";
+  }
 
   // Непонятную дату показываем как есть: лучше странная строка, чем пустое место.
   function fmtDay(iso) {
@@ -372,36 +384,80 @@
     areaTitle: tt.area.get(t.area) || t.area || "", topic: tt.topic.get(t.topic) || "",
   });
 
-  // «Сегодня»: главная задача, задачи дня по сферам, счётчик, «висят» и «ждут распределения».
+  // Время задачи «ЧЧ:ММ» (она — событие в этот час своего дня) или пустая строка, если времени нет.
+  const timeOf = (t) => (/^([01]\d|2[0-3]):[0-5]\d$/.test(String(t.time || "")) ? t.time : "");
+  // Задачи с временем — первыми и по времени; остальные — в том порядке, в каком пришли.
+  const byTime = (a, b) => (a.time && b.time ? a.time.localeCompare(b.time) : (b.time ? 1 : 0) - (a.time ? 1 : 0));
+
+  // Подпись дня на полосе: «Сегодня», «Завтра», «Вчера», иначе «чт 8»; в другом месяце — «вс 1 нояб».
+  function chipLabel(date, today) {
+    if (date === today) return "Сегодня";
+    if (date === addDays(today, 1)) return "Завтра";
+    if (date === addDays(today, -1)) return "Вчера";
+    const p = parts(date), now = parts(today);
+    const label = `${WEEKDAYS_SHORT[weekday(p)]} ${p.d}`;
+    return p.y === now.y && p.m === now.m ? label : `${label} ${MONTHS_CHIP[p.m - 1]}`;
+  }
+
+  // Полоса дней во вкладке «Задачи»: от трёх дней назад до двух недель вперёд и каждый более поздний день,
+  // на котором стоят задачи. picked — выбранный день: он на полосе всегда.
+  // Ответ: [{ date, label, open, picked }] по порядку дней; open — сколько задач этого дня ещё открыто.
+  function dayStrip(state, today, picked) {
+    if (!parts(today)) return [];
+    const dates = new Set();
+    for (let i = -DAYS_BACK; i <= DAYS_AHEAD; i++) dates.add(addDays(today, i));
+    const end = addDays(today, DAYS_AHEAD);
+    const open = new Map();
+    for (const t of state.tasks) {
+      if (!parts(t.day)) continue;
+      if (t.day > end) dates.add(t.day);
+      if (t.status === "open") open.set(t.day, (open.get(t.day) || 0) + 1);
+    }
+    if (parts(picked)) dates.add(picked);
+    return [...dates].sort().map((date) => ({
+      date, label: chipLabel(date, today), open: open.get(date) || 0, picked: date === picked,
+    }));
+  }
+
+  // День во вкладке «Задачи»: задачи, чей текущий день — date, по сферам (с временем — первыми), счётчик.
+  // Только на сегодняшнем дне: главная задача, «висят» и «ждут распределения».
+  // Только на прошедшем: moved — задачи, которые стояли на этом дне и перенесены на более поздний.
   // keepIds — задачи, отмеченные на этом экране: не исчезают из «висят», пока экран открыт,
   // иначе строка уходит из-под пальца и второе нажатие попадает в соседнюю.
-  function deriveToday(state, today, keepIds) {
+  function deriveDay(state, date, today, keepIds) {
+    const isToday = date === today;
     const keep = new Set(keepIds || []);
     const tt = titles(state);
-    const todays = state.tasks.filter((t) => t.day === today);
+    const item = (t) => ({ ...row(t, tt), time: timeOf(t) });
+    const list = state.tasks.filter((t) => t.day === date);
     // главная задача назначена на день сводки; если сводка вчерашняя, сегодня главной ещё нет
-    const main = (state.today === today && state.main && state.tasks.find((t) => t.id === state.main)) || null;
+    const main = (isToday && state.today === today && state.main && state.tasks.find((t) => t.id === state.main)) || null;
     const groups = [];
-    for (const id of areaOrder(state, todays)) {
-      const tasks = todays.filter((t) => t.area === id && !(main && t.id === main.id));
+    for (const id of areaOrder(state, list)) {
+      const tasks = list.filter((t) => t.area === id && !(main && t.id === main.id)).map(item).sort(byTime);
       if (!tasks.length) continue;
       groups.push({
-        id, title: tt.area.get(id) || id, tasks: tasks.map((t) => row(t, tt)),
+        id, title: tt.area.get(id) || id, tasks,
         done: tasks.filter((t) => t.status === "done").length, total: tasks.length,
       });
     }
     const stays = (t) => t.status === "open" || keep.has(t.id);
+    const was = (t) => Array.isArray(t.days) && t.days.includes(date);
     return {
-      date: today,
-      main: main ? row(main, tt) : null,
+      date, isToday,
+      main: main ? item(main) : null,
       groups,
-      done: todays.filter((t) => t.status === "done").length,
-      total: todays.length,
-      hanging: state.tasks.filter((t) => t.day && t.day < today && stays(t))
+      done: list.filter((t) => t.status === "done").length,
+      total: list.length,
+      moved: date < today ? state.tasks.filter((t) => was(t) && t.day > date).map((t) => row(t, tt)) : [],
+      hanging: !isToday ? [] : state.tasks.filter((t) => t.day && t.day < today && stays(t))
         .sort((a, b) => b.day.localeCompare(a.day)).map((t) => row(t, tt)),
-      backlog: state.tasks.filter((t) => !t.day && !t.goal && stays(t)).map((t) => row(t, tt)),
+      backlog: !isToday ? [] : state.tasks.filter((t) => !t.day && !t.goal && stays(t)).map((t) => row(t, tt)),
     };
   }
+
+  // Сегодняшний день. Так его спрашивает app.js прежнего выпуска, если запас отдал его вместе с этим logic.js.
+  const deriveToday = (state, today, keepIds) => deriveDay(state, today, today, keepIds);
 
   // «Цели»: сфера → цель → подзадачи. Шкала считается по задачам (с учётом своих отметок).
   function deriveGoals(state) {
@@ -460,12 +516,17 @@
 
   // ---------- напоминания ----------
 
-  // С какой вкладки начать: ?tab=say (так открывает уведомление), иначе #say, иначе «Сегодня».
+  // Вкладка по её имени: tasks и today — «Задачи». Незнакомое имя — пустая строка.
+  function tabId(name) {
+    const id = name === "tasks" ? "today" : name;
+    return TABS.includes(id) ? id : "";
+  }
+
+  // С какой вкладки начать: ?tab=say или ?tab=tasks (так открывает уведомление), иначе #say, иначе «Задачи».
   function startTab(search, hash) {
     let want = null;
     try { want = new URLSearchParams(String(search || "")).get("tab"); } catch (e) { want = null; }
-    if (!TABS.includes(want)) want = String(hash || "").replace(/^#/, "");
-    return TABS.includes(want) ? want : "today";
+    return tabId(want) || tabId(String(hash || "").replace(/^#/, "")) || "today";
   }
 
   // Сколько задач на сегодня ещё открыто: это число стоит на значке приложения.
@@ -517,7 +578,7 @@
     return push.broken ? "renew" : "subscribe";
   }
 
-  // Что показать о напоминаниях вверху «Сегодня».
+  // Что показать о напоминаниях во вкладке «Задачи» на сегодняшнем дне.
   //   installed  — приложение открыто с экрана «Домой» (в обычной вкладке пуши на iPhone не работают);
   //   supported  — устройство умеет пуши; permission — Notification.permission;
   //   phase      — что сейчас с включением: "" | "busy" | "enabled" | "failed".
@@ -587,13 +648,14 @@
     offsetOf, dateAt, isoAt,
     fmtDay, fmtDayLong, fmtDayShort, fmtRange, fmtMonth, fmtWhen,
     inboxId, inboxPath, cleanText, textMessage, opsMessage, inboxBody, utf8ToBase64,
-    VERSION: "2026-10-05.3",   // та же строка в app.js
+    VERSION: "2026-10-05.4",   // та же строка в app.js
     validRepo, request, classify, errorText, afterPutError, serialQueue,
     parseState, dayCounts,
     nextStatus, tapTask, takeBatch, markBatchSent, renameBatch, repairPending, overlayState,
     outboxEntry, replyTo, pruneOutbox, isWaiting, buildFeed,
     deriveToday, deriveGoals, deriveReview,
-    TABS, PUSH_WAIT_MS, startTab, openToday,
+    DAYS_BACK, DAYS_AHEAD, addDays, dayStrip, deriveDay,
+    TABS, PUSH_WAIT_MS, tabId, startTab, openToday,
     base64urlToBytes, endpointHash, pushInfo, pushHeal, pushNotice, deviceName, subscribeOp,
     mockProcess,
   };

@@ -87,7 +87,38 @@ button { touch-action: manipulation; -webkit-tap-highlight-color: transparent; c
 .bar { height: 8px; background: var(--line); border-radius: 99px; overflow: hidden; }
 .bar > i { display: block; height: 100%; width: 0; background: var(--done); border-radius: 99px; transition: width .25s; }
 .total { margin-bottom: 18px; }
-.total-label { display: flex; justify-content: space-between; gap: 12px; font-size: 14px; color: var(--muted); margin-bottom: 6px; }
+.total-label {
+  display: flex; justify-content: space-between; align-items: baseline; gap: 12px;
+  font-size: 14px; color: var(--muted); margin-bottom: 6px;
+}
+.total-label > span:last-child { flex: none; }
+.day-name { color: var(--ink); font-size: 16px; font-weight: 600; }
+.day-name::first-letter { text-transform: uppercase; }
+
+/* полоса дней: листается вбок сама, страницу в ширину не растягивает */
+.days {
+  position: relative; display: flex; gap: 8px; margin-bottom: 16px; padding-bottom: 2px;
+  overflow-x: auto; overscroll-behavior-x: contain; scrollbar-width: thin;
+}
+.days:empty { display: none; }
+@media (hover: none) {
+  .days { scrollbar-width: none; }
+  .days::-webkit-scrollbar { display: none; }
+}
+.chip {
+  flex: none; display: inline-flex; align-items: center; gap: 6px; min-height: 44px; padding: 0 14px;
+  border: 1px solid var(--line); border-radius: 12px; background: var(--card); color: var(--ink);
+  font-size: 15px; white-space: nowrap; -webkit-user-select: none; user-select: none;
+}
+.chip:active { opacity: .8; }
+.chip:focus-visible { outline-offset: -3px; }
+.chip[aria-pressed="true"] { background: var(--ink); border-color: var(--ink); color: var(--bg); font-weight: 600; }
+/* число открытых задач — кружком, чтобы не читалось как часть даты («пт 9» и «3», а не «пт 93») */
+.chip .count {
+  min-width: 20px; padding: 0 6px; border-radius: 10px; background: var(--line); color: var(--ink);
+  font-size: 12px; line-height: 20px; font-weight: 600; text-align: center;
+}
+.chip[aria-pressed="true"] .count { background: var(--bg); }
 
 /* карточки */
 .grid { display: grid; gap: 14px; grid-template-columns: repeat(auto-fill, minmax(min(320px, 100%), 1fr)); align-items: start; }
@@ -145,6 +176,17 @@ li + li { border-top: 1px dashed var(--line); }
 .task[data-s="fail"] .box { background: var(--fail); border-color: var(--fail); color: #fff; }
 .task[data-s="fail"] .box::after { content: "✕"; }
 .task[data-s="fail"] .txt > span { color: var(--muted); }
+/* время события — перед текстом задачи */
+.time { margin-right: .4em; font-weight: 600; font-variant-numeric: tabular-nums; color: var(--accent-ink); }
+.task[data-s="done"] .time, .task[data-s="fail"] .time { color: inherit; }
+
+/* перенесённые с этого дня на другой: видны, но не нажимаются */
+.card.moved { margin-top: 14px; background: none; border-style: dashed; box-shadow: none; }
+.card.moved h2 { font-size: 16px; color: var(--muted); }
+.task.gone { color: var(--muted); }
+.task.gone, .task.gone:active, .task.gone:hover { background: none; }
+.task.gone .box { border-style: dashed; }
+.task.gone .box::after { content: "→"; color: var(--muted); }
 
 /* свёрнутые блоки */
 .fold { margin-top: 14px; border: 2px dashed var(--line); border-radius: 16px; padding: 0 12px; }

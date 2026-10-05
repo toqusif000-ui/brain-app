@@ -1,8 +1,10 @@
-// Тесты чистых функций. Запуск из папки приложения: node --test tests/
+// Тесты чистых функций и — в конце файла — app.js и sw.js целиком в поддельном окружении (harness.mjs).
+// Запуск из папки приложения: node --test tests/
 import test from "node:test";
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import L from "../logic.js";
+import { FakeStorage, fakeGitHub, settle, startApp, startWorker } from "./harness.mjs";
 
 const fixtureText = readFileSync(new URL("../mock/state.json", import.meta.url), "utf8");
 const fixture = () => L.parseState(fixtureText);
@@ -150,15 +152,27 @@ test("что значит ответ GitHub", () => {
 
 test("сбой PUT: что делать с сообщением", () => {
   const fresh = { tried: false, renamed: false };
-  assert.equal(L.afterPutError(fresh, "conflict", 409), "rename");
+  const tried = { tried: true, renamed: false };
+  // 409 — ничего не записано: повторяем позже под тем же именем, иначе файл встанет не на своё место по порядку
+  assert.equal(L.afterPutError(fresh, "conflict", 409), "later");
+  assert.equal(L.afterPutError(tried, "conflict", 409), "later");
+  assert.equal(L.afterPutError({ tried: true, renamed: true }, "conflict", 409), "later");
+  // 422 без единой попытки с неизвестным исходом — имя занято чужим файлом: один раз пробуем под новым
   assert.equal(L.afterPutError(fresh, "conflict", 422), "rename");
-  assert.equal(L.afterPutError({ tried: false, renamed: true }, "conflict", 409), "later", "новое имя пробуем один раз");
-  assert.equal(L.afterPutError({ tried: false, renamed: true }, "conflict", 422), "later");
-  // прошлая попытка оборвалась, а теперь «файл уже есть» — значит, она дошла; второй раз не шлём
-  assert.equal(L.afterPutError({ tried: true, renamed: false }, "conflict", 422), "delivered");
-  assert.equal(L.afterPutError({ tried: true, renamed: false }, "conflict", 409), "rename");
+  assert.equal(L.afterPutError({ tried: false, renamed: true }, "conflict", 422), "later", "новое имя пробуем один раз");
+  // прошлая попытка оборвалась, а теперь «файл уже есть» — значит, она дошла; второй раз не шлём и не переименовываем
+  assert.equal(L.afterPutError(tried, "conflict", 422), "delivered");
+  assert.equal(L.afterPutError({ tried: true, renamed: true }, "conflict", 422), "delivered");
   for (const kind of ["auth", "forbidden", "notfound"]) assert.equal(L.afterPutError(fresh, kind, 0), "setup");
   for (const kind of ["offline", "timeout", "server", "rate"]) assert.equal(L.afterPutError(fresh, kind, 0), "later");
+  for (const kind of ["offline", "timeout", "server", "rate"]) assert.equal(L.afterPutError(tried, kind, 0), "later");
+});
+
+test("ответ на своё сообщение в сводке", () => {
+  const state = fixture();
+  assert.equal(L.replyTo(state, state.replies[1].id), state.replies[1]);
+  assert.equal(L.replyTo(state, "20261005T110211Z-a1b2c3"), null);
+  assert.equal(L.replyTo(null, state.replies[1].id), null, "сводки ещё нет");
 });
 
 test("очередь: строго по одному, сбой не останавливает", async () => {
@@ -394,6 +408,34 @@ test("«Обзор»: дни, итоги месяцев, решения", () => 
   assert.deepEqual(L.deriveReview(shuffled).days, vm.days);
 });
 
+test("«Обзор»: итоги месяца берутся из сводки, а не складываются из дней", () => {
+  // счёт ядра по месяцу: задача, перенесённая внутри месяца, считается один раз, поэтому он не равен сумме дней
+  const months = [
+    { month: "2026-10", planned: 12, done: 7, fail: 1, moved: 0, open: 4 },
+    { month: "2026-09", planned: 7, done: 6, fail: 1, moved: 0, open: 0 },
+  ];
+  const state = L.parseState({ ...JSON.parse(fixtureText), months });
+  assert.deepEqual(L.deriveReview(state).months, [
+    { month: "2026-10", planned: 12, done: 7, fail: 1, moved: 0 },
+    { month: "2026-09", planned: 7, done: 6, fail: 1, moved: 0 },
+  ]);
+  // новые сверху, в каком бы порядке ни пришли
+  assert.deepEqual(L.deriveReview({ ...state, months: [...months].reverse() }).months.map((m) => m.month), ["2026-10", "2026-09"]);
+
+  // прошлый месяц виден и тогда, когда его дни уже ушли из таблицы за 30 дней
+  const november = { ...state, days: [], months: [{ month: "2026-10", planned: 15, done: 12, fail: 2, moved: 1, open: 0 }] };
+  assert.deepEqual(L.deriveReview(november).months, [{ month: "2026-10", planned: 15, done: 12, fail: 2, moved: 1 }]);
+
+  // ядро сказало «месяцев нет» — верим ему, а не дням; чисел нет — считаем нулём
+  assert.deepEqual(L.deriveReview({ ...state, months: [] }).months, []);
+  assert.deepEqual(L.deriveReview({ ...state, months: [{ month: "2026-10" }] }).months,
+    [{ month: "2026-10", planned: 0, done: 0, fail: 0, moved: 0 }]);
+
+  // сводка от прежнего ядра, поля months нет — как раньше, сумма по дням
+  assert.equal(fixture().months, undefined);
+  assert.deepEqual(L.deriveReview(fixture()).months.map((m) => [m.month, m.planned]), [["2026-10", 14], ["2026-09", 8]]);
+});
+
 // ---------- свои отметки ----------
 
 test("нажатие: открыта → сделана → не сделана → открыта", () => {
@@ -605,4 +647,353 @@ test("пробный режим изображает разбор", () => {
   assert.equal(feed[0].phase, "answered");
   assert.equal(feed[0].text, "проверка связи");
   assert.match(feed[0].reply, /пробный режим/i);
+});
+
+// ---------- приложение целиком: отправка ----------
+
+// Открывает приложение с уже вставленным ключом (key: false — без ключа, на экране настройки).
+// По умолчанию оно установлено на экран «Домой»; home: false — обычная вкладка браузера.
+async function boot(options = {}) {
+  const clock = options.clock || { now: at("2026-10-05T12:20:00+03:00") };
+  const gh = options.gh || fakeGitHub(clock, { ...JSON.parse(fixtureText), ...options.state });
+  const local = options.local || new FakeStorage();
+  const session = options.session || new FakeStorage();
+  const home = options.home !== false;
+  const disk = home || options.ios ? local : session;   // где приложение должно держать своё
+  if (options.key !== false) disk.setItem("brain:token", JSON.stringify("KEY"));
+  const app = startApp({ clock, gh, local, session, home, ios: options.ios });
+  await settle();
+  return { app, gh, clock, local, session, disk };
+}
+const queued = (disk) => disk.read("outbox").filter((e) => e.state === "queued");
+
+test("ответ на PUT потерялся, а сообщение уже разобрали: второй раз оно не отправляется", async () => {
+  const { app, gh, disk } = await boot();
+  gh.plan.push("lost");
+  await app.say("купить домен");
+  const [entry] = disk.read("outbox");
+  assert.deepEqual([entry.state, entry.tried], ["queued", true], "исход попытки неизвестен");
+  assert.deepEqual(gh.accepted, [entry.id], "файл на самом деле лёг");
+  assert.equal(gh.dispatches, 0);
+
+  gh.process(entry.id);   // разобрал запуск по расписанию или запуск от прошлого сообщения
+  const mark = gh.log.length;
+  await app.wake();
+  assert.deepEqual(gh.accepted, [entry.id], "один принятый PUT на одно сообщение");
+  assert.ok(!gh.log.slice(mark).some((line) => line.startsWith("PUT")), "повторного PUT не было вовсе");
+  assert.equal(gh.dispatches, 0, "разбирать больше нечего");
+  assert.deepEqual(disk.read("outbox"), [], "сообщение с ответом забыто");
+  await app.click({ act: "tab", tab: "say" });
+  assert.match(app.text("feed"), /купить домен/);
+  assert.match(app.text("feed"), /Записал\./);
+});
+
+test("приложение закрыли посреди PUT, сообщение разобрали: после запуска оно не отправляется заново", async () => {
+  const first = await boot();
+  first.gh.plan.push("hang");
+  await first.app.say("купить домен");
+  const [entry] = first.disk.read("outbox");
+  assert.deepEqual([entry.state, entry.tried], ["queued", true]);
+  first.gh.process(entry.id);
+
+  const { clock, gh, local, session } = first;
+  await boot({ clock, gh, local, session });   // то же устройство, приложение открыто заново
+  assert.deepEqual(gh.accepted, [entry.id]);
+  assert.equal(gh.dispatches, 0);
+  assert.deepEqual(local.read("outbox"), []);
+});
+
+test("ответ на PUT потерялся, файл ещё не разобран: повтор получает 422 и считается доставленным", async () => {
+  const { app, gh, disk } = await boot();
+  gh.plan.push("lost");
+  await app.say("купить домен");
+  const [entry] = disk.read("outbox");
+  const mark = gh.log.length;
+  await app.wake();
+  // свежая сводка читается прямо перед повтором (второй GET), ответа в ней нет — тогда PUT
+  assert.deepEqual(gh.log.slice(mark), ["GET state", "GET state", "PUT " + entry.id, "POST dispatches"]);
+  assert.deepEqual(gh.accepted, [entry.id]);
+  assert.deepEqual([...gh.files.keys()], [entry.id], "файл один, под тем же именем");
+  assert.equal(gh.dispatches, 1);
+  assert.deepEqual(queued(disk), []);
+});
+
+test("перед повтором сводка не читается: сообщение всё равно уходит, повтор отсеет ядро по id", async () => {
+  const { app, gh, disk } = await boot();
+  gh.plan.push("lost");
+  await app.say("купить домен");
+  const [entry] = disk.read("outbox");
+  gh.process(entry.id);
+  gh.stateStatus = 500;
+  await app.wake();
+  // Файл лёг второй раз под тем же id: ядро такой id второй раз не применяет, а сообщение не застревает на устройстве.
+  assert.deepEqual(gh.accepted, [entry.id, entry.id]);
+  assert.equal(queued(disk).length, 0);
+});
+
+test("сводки в репозитории ещё нет: повтор после оборванной попытки всё равно уходит", async () => {
+  const { app, gh, disk } = await boot({ gh: fakeGitHub({ now: 0 }, null) });
+  gh.online = false;
+  await app.say("первое сообщение");
+  assert.equal(disk.read("outbox")[0].tried, true);
+  gh.online = true;
+  await app.wake();
+  assert.equal(gh.accepted.length, 1);
+  assert.deepEqual(queued(disk), []);
+});
+
+test("разбор сообщения не удался (ok: false): повторного PUT нет, но разбор зовём ещё раз", async () => {
+  const { app, gh, disk } = await boot();
+  gh.plan.push("lost");
+  await app.say("купить домен");
+  const [entry] = disk.read("outbox");
+  // файл остался во входящих, в ответах — запись о неудаче
+  const failed = { id: entry.id, at: gh.state.generated_at, text: entry.file.text, reply: "Не получилось: кончился лимит.", ok: false, applied: 0, errors: [] };
+  gh.state = { ...gh.state, replies: [failed, ...gh.state.replies] };
+  const mark = gh.log.length;
+  await app.wake();
+  assert.deepEqual(gh.log.slice(mark), ["GET state", "GET state", "POST dispatches"]);
+  assert.deepEqual(gh.accepted, [entry.id]);
+});
+
+test("GitHub ответил 502, хотя файл записал: повтор не переименовывается и второго файла нет", async () => {
+  const { app, gh, disk } = await boot();
+  gh.plan.push({ status: 502, lands: true });
+  await app.say("купить домен");
+  const [entry] = disk.read("outbox");
+  assert.deepEqual([entry.state, entry.tried], ["queued", true], "после ошибки сервера исход неизвестен");
+  await app.wake();
+  assert.deepEqual(gh.accepted, [entry.id]);
+  assert.deepEqual([...gh.files.keys()], [entry.id]);
+  assert.equal(gh.dispatches, 1);
+  assert.deepEqual(queued(disk), []);
+});
+
+test("ответ потерялся, потом 409: сообщение остаётся под тем же именем и не задваивается", async () => {
+  const { app, gh, disk } = await boot();
+  gh.plan.push("lost", { status: 409 });
+  await app.say("купить домен");
+  const [entry] = disk.read("outbox");
+  await app.wake();   // вторая попытка: 409, сразу третья: 422 — файл уже лежит
+  assert.deepEqual(gh.accepted, [entry.id]);
+  assert.deepEqual([...gh.files.keys()], [entry.id]);
+  assert.deepEqual(queued(disk), []);
+});
+
+test("409 на первый набор отметок: он уходит под своим именем раньше второго", async () => {
+  const { app, gh, clock, disk } = await boot();
+  const task = taskByText(gh.state, "Записать первый урок");
+  let release;
+  gh.plan.push({ hold: new Promise((resolve) => { release = resolve; }) });
+  await app.click({ act: "task", id: task.id });   // открыта → сделана
+  await app.flushTaps();                           // первый набор в пути, GitHub пока молчит
+  clock.now += 2000;
+  await app.click({ act: "task", id: task.id });   // сделана → не сделана
+  await app.flushTaps();                           // второй набор ждёт своей очереди
+  const [b1, b2] = disk.read("outbox").map((e) => e.id);
+  clock.now += 2000;
+  release({ status: 409 });
+  await settle();
+  // 409: ничего не записано, первый набор сразу уходит снова под прежним именем, второй — следом
+  assert.deepEqual(gh.accepted, [b1, b2]);
+  assert.deepEqual([...gh.accepted].sort(), gh.accepted, "разбор идёт по имени: порядок файлов — порядок нажатий");
+  assert.deepEqual(gh.accepted.map((id) => gh.files.get(id).ops[0].status), ["done", "fail"], "последнее нажатие применится последним");
+});
+
+// ---------- приложение целиком: «Обзор» ----------
+
+test("экран «Обзор» показывает месяцы из сводки, без оговорки про 30 дней", async () => {
+  const months = [
+    { month: "2026-10", planned: 41, done: 37, fail: 3, moved: 1, open: 0 },
+    { month: "2026-09", planned: 58, done: 52, fail: 4, moved: 2, open: 0 },
+  ];
+  const { app } = await boot({ state: { months } });
+  await app.click({ act: "tab", tab: "review" });
+  const text = app.text("tab-review");
+  assert.match(text, /Октябрь 2026 41 запланировано 37 сделано 3 не сделано 1 перенесено/);
+  assert.match(text, /Сентябрь 2026 58 запланировано 52 сделано 4 не сделано 2 перенесено/);
+  assert.doesNotMatch(text, /30 дней/);
+  assert.doesNotMatch(text, /из таблицы выше/);
+});
+
+// ---------- приложение целиком: память устройства ----------
+
+test("на устройстве нет места: текст остаётся в поле, пока сообщение не уйдёт", async () => {
+  const { app, gh, local } = await boot();
+  local.full = true;
+  gh.online = false;
+  await app.say("позвонить Ане");
+  assert.equal(app.el("say").value, "позвонить Ане", "сохранить не удалось — поле не очищаем");
+  assert.doesNotMatch(app.text("banner"), /сохранено/, "не обещаем того, чего нет");
+  assert.match(app.text("banner"), /Нет связи\./);
+  assert.match(app.text("banner"), /не закрывай приложение/);
+
+  await app.say();   // текст всё ещё в поле, «Отправить» нажали ещё раз
+  gh.online = true;
+  await app.wake();
+  assert.equal(gh.accepted.length, 1, "второе нажатие не создало второго сообщения");
+  assert.equal(gh.files.get(gh.accepted[0]).text, "позвонить Ане");
+  assert.equal(app.el("say").value, "", "ушло в GitHub — теперь поле можно очистить");
+});
+
+test("на устройстве нет места, но связь есть: сообщение уходит сразу и поле очищается", async () => {
+  const { app, gh, local } = await boot();
+  local.full = true;
+  await app.say("позвонить Ане");
+  assert.equal(gh.accepted.length, 1);
+  assert.equal(app.el("say").value, "");
+});
+
+test("пока сообщение не сохранено, новый текст в поле не стирается", async () => {
+  const { app, gh, local } = await boot();
+  local.full = true;
+  gh.online = false;
+  await app.say("позвонить Ане");
+  app.el("say").value = "и ещё написать Боре";   // начал печатать следующее
+  gh.online = true;
+  await app.wake();
+  assert.equal(gh.accepted.length, 1);
+  assert.equal(app.el("say").value, "и ещё написать Боре");
+});
+
+test("сообщение сохранено на устройстве: поле очищается сразу, об этом сказано", async () => {
+  const { app, gh, local } = await boot();
+  gh.online = false;
+  await app.say("позвонить Ане");
+  assert.equal(app.el("say").value, "");
+  assert.equal(local.read("outbox").length, 1);
+  assert.match(app.text("banner"), /Сказанное сохранено на устройстве — отправлю, как только получится\./);
+});
+
+test("обычная вкладка: ключ, исходящие и сводка живут в sessionStorage, в общий localStorage ничего не пишется", async () => {
+  const { app, gh, local, session } = await boot({ home: false, key: false });
+  assert.equal(app.screen(), "setup");
+  assert.match(app.text("setupForm"), /В обычной вкладке ключ хранится только до её закрытия/);
+  await app.connect("TEST-KEY-1");
+  assert.equal(app.screen(), "app");
+  assert.equal(session.read("token"), "TEST-KEY-1");
+  assert.equal(session.read("state").today, TODAY);
+
+  gh.online = false;
+  await app.click({ act: "task", id: taskByText(gh.state, "Записать первый урок").id });
+  await app.say("позвонить Ане");
+  assert.equal(session.read("outbox").length, 1);
+  assert.equal(Object.keys(session.read("pending")).length, 1);
+  assert.deepEqual(local.keys(), [], "соседние сайты того же адреса ничего не увидят");
+  assert.match(app.text("banner"), /Сказанное сохранено до закрытия вкладки — отправлю, как только получится\./);
+  assert.doesNotMatch(app.text("banner"), /на устройстве/);
+});
+
+test("приложение с экрана «Домой»: всё хранится в localStorage, строки про вкладку нет", async () => {
+  for (const mode of [{ home: true }, { home: false, ios: true }]) {
+    const { app, gh, local, session } = await boot({ ...mode, key: false });
+    assert.equal(app.screen(), "setup");
+    assert.doesNotMatch(app.text("setupForm"), /вкладк/);
+    await app.connect("TEST-KEY-1");
+    gh.online = false;
+    await app.say("позвонить Ане");
+    assert.equal(local.read("token"), "TEST-KEY-1");
+    assert.equal(local.read("state").today, TODAY);
+    assert.equal(local.read("outbox").length, 1);
+    assert.deepEqual(session.keys(), []);
+  }
+});
+
+
+// ---------- сервис-воркер ----------
+
+const page = (body, status = 200) => ({ body, status, ok: status >= 200 && status < 300, clone() { return page(body, status); } });
+const PENDING = Symbol("ответа ещё нет");
+const peek = (promise) => Promise.race([promise, settle().then(() => PENDING)]);
+
+test("воркер: сеть молчит — через три секунды отвечает запасом, а запас обновляет в фоне", async () => {
+  let arrive;
+  const worker = startWorker({
+    cached: { "app.js": page("старый") },
+    fetch: () => new Promise((resolve) => { arrive = resolve; }),
+  });
+  const event = worker.request("app.js");
+  assert.equal(await peek(event.response), PENDING, "сначала ждём сеть");
+  assert.deepEqual(worker.timers.filter((t) => t.on).map((t) => t.ms), [3000]);
+  await worker.fire();
+  assert.equal((await peek(event.response)).body, "старый");
+
+  arrive(page("новый"));   // сеть всё-таки ответила — уже после того, как страница получила запас
+  await Promise.all(event.waits);
+  assert.equal(worker.stored("app.js").body, "новый");
+});
+
+test("воркер: сеть только что молчала — остальные файлы оболочки идут из запаса сразу, без новых трёх секунд", async () => {
+  const worker = startWorker({
+    cached: { "index.html": page("страница"), "logic.js": page("логика"), "app.js": page("экраны") },
+    fetch: () => new Promise(() => {}),
+  });
+  const first = worker.request("index.html");
+  await worker.fire();
+  assert.equal((await peek(first.response)).body, "страница");
+
+  // страница запрашивает скрипты один за другим: ждать по три секунды на каждый — это пустой экран на десятки секунд
+  const second = worker.request("logic.js");
+  await settle();
+  assert.deepEqual(worker.timers.map((t) => t.ms), [3000, 0]);
+  await worker.fire();
+  assert.equal((await peek(second.response)).body, "логика");
+
+  // через десять секунд снова даём сети её три секунды
+  worker.clock.now += 10001;
+  worker.request("app.js");
+  await settle();
+  assert.deepEqual(worker.timers.map((t) => t.ms), [3000, 0, 3000]);
+});
+
+test("воркер: сеть молчит, а запаса нет — ждёт сеть", async () => {
+  let arrive;
+  const worker = startWorker({ fetch: () => new Promise((resolve) => { arrive = resolve; }) });
+  const event = worker.request("app.js");
+  await worker.fire();
+  assert.equal(await peek(event.response), PENDING);
+  arrive(page("новый"));
+  assert.equal((await event.response).body, "новый");
+});
+
+test("воркер: свежий ответ отдаётся, даже если положить его в запас не вышло", async () => {
+  const worker = startWorker({ cached: { "app.js": page("старый") }, fetch: async () => page("новый") });
+  worker.putFails = true;
+  const event = worker.request("app.js");
+  assert.equal((await event.response).body, "новый");
+  assert.equal(worker.stored("app.js").body, "старый");
+});
+
+test("воркер: сеть ответила вовремя — свежий ответ, запас обновлён, таймер снят", async () => {
+  const asked = [];
+  const worker = startWorker({
+    cached: { "app.js": page("старый") },
+    fetch: async (url, init) => { asked.push([url, init.cache]); return page("новый"); },
+  });
+  const event = worker.request("app.js?v=2#top");
+  assert.equal((await event.response).body, "новый");
+  assert.equal(worker.stored("app.js").body, "новый");
+  assert.deepEqual(asked, [[worker.base + "app.js", "no-cache"]]);
+  assert.deepEqual(worker.timers.filter((t) => t.on), []);
+});
+
+test("воркер: сети нет или сервер ответил ошибкой — запас; чужие адреса не трогает", async () => {
+  const offline = startWorker({ cached: { "app.js": page("старый") }, fetch: async () => { throw new TypeError("Failed to fetch"); } });
+  assert.equal((await offline.request("app.js").response).body, "старый");
+  assert.equal((await offline.request("style.css").response).body, "network error", "нет ни сети, ни запаса");
+
+  const broken = startWorker({ cached: { "app.js": page("старый") }, fetch: async () => page("сбой", 503) });
+  assert.equal((await broken.request("app.js").response).body, "старый");
+  assert.equal((await broken.request("style.css").response).status, 503);
+  assert.equal(broken.stored("style.css"), undefined, "ошибку в запас не кладём");
+
+  const event = broken.request("https://api.github.com/repos/owner/brain/contents/data/state.json");
+  assert.equal(event.response, null, "запросы к GitHub идут мимо воркера");
+});
+
+test("воркер: имя запаса новое, прежний запас удаляется при обновлении", async () => {
+  const worker = startWorker({ oldCaches: ["brain-shell-v1"], fetch: async () => page("новый") });
+  assert.notEqual(worker.cacheName, "brain-shell-v1");
+  await worker.activate();
+  assert.deepEqual(worker.cacheNames(), [worker.cacheName]);
 });

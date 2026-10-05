@@ -3,6 +3,17 @@
   "use strict";
 
   const L = window.BrainLogic;
+  const VERSION = "2026-10-05.2";   // та же строка в logic.js
+  try {
+    // При медленной сети запас может отдать app.js и logic.js разных версий. Один раз перезагружаемся:
+    // к этому времени запас уже обновился целиком.
+    if (L.VERSION !== VERSION && !sessionStorage.getItem("brain:reloaded")) {
+      sessionStorage.setItem("brain:reloaded", "1");
+      location.reload();
+      return;
+    }
+    if (L.VERSION === VERSION) sessionStorage.removeItem("brain:reloaded");
+  } catch (e) { /* хранилище недоступно — работаем как есть */ }
   const CFG = window.BRAIN_CONFIG || {};
   const REPO = String(CFG.repo || "");
   const OFFSET = Number.isFinite(CFG.utcOffsetMinutes) ? CFG.utcOffsetMinutes : 180;
@@ -18,23 +29,42 @@
 
   // ---------- память устройства ----------
 
+  // Приложение, установленное на экран «Домой», хранит своё отдельно от браузера — там всё лежит в localStorage.
+  // В обычной вкладке localStorage общий со всеми сайтами того же адреса (соседние страницы GitHub Pages),
+  // поэтому ключ, исходящие и сводка живут в sessionStorage: только в этой вкладке и до её закрытия.
+  const HOME = (() => {
+    try {
+      return navigator.standalone === true ||
+        (typeof matchMedia === "function" && matchMedia("(display-mode: standalone)").matches);
+    } catch (e) {
+      return false;
+    }
+  })();
+
   // В пробном режиме на устройство ничего не пишется.
   const store = (() => {
     const mem = new Map();
+    const disk = () => (HOME ? localStorage : sessionStorage);
     return {
       get(key) {
         if (mem.has(key)) return mem.get(key);
         let value = null;
         if (!MOCK) {
-          try { value = JSON.parse(localStorage.getItem("brain:" + key)); } catch (e) { value = null; }
+          try { value = JSON.parse(disk().getItem("brain:" + key)); } catch (e) { value = null; }
         }
         mem.set(key, value);
         return value;
       },
+      // true — значение легло на устройство; false — оно только в памяти и пропадёт, когда приложение закроют
       set(key, value) {
         mem.set(key, value);
-        if (MOCK) return;
-        try { localStorage.setItem("brain:" + key, JSON.stringify(value)); } catch (e) { /* живём до закрытия */ }
+        if (MOCK) return true;
+        try {
+          disk().setItem("brain:" + key, JSON.stringify(value));
+          return true;
+        } catch (e) {
+          return false;
+        }
       },
     };
   })();
@@ -53,6 +83,8 @@
   let checking = false;
   let batchTimer = 0;
   let pollTimer = 0;
+  let saved = true;           // легла ли последняя запись исходящих на устройство
+  let held = null;            // сообщение, которое не удалось сохранить: его текст пока остаётся в поле
   const keep = new Set();     // задачи, отмеченные на открытом экране: не исчезают из-под пальца
   const fold = { hanging: false, backlog: false };
   const painted = new Map();
@@ -63,7 +95,16 @@
 
   function saveLocal() {
     store.set("pending", pending);
-    store.set("outbox", outbox);
+    saved = store.set("outbox", outbox);
+    // Текст остаётся в поле, пока сообщение не окажется в надёжном месте: на устройстве или уже в GitHub.
+    if (held && (saved || held.state === "sent")) {
+      const field = $("say");
+      if (L.cleanText(field.value) === held.file.text) {   // если там уже печатают следующее — не трогаем
+        field.value = "";
+        store.set("draft", "");
+      }
+      held = null;
+    }
   }
 
   function newId(now) {
@@ -182,7 +223,12 @@
   function trouble(kind, status) {
     let text = L.errorText(kind, status);
     if ((kind === "offline" || kind === "timeout") && confirmed) text += " Показываю последнюю сводку.";
-    if (outbox.some((e) => e.state === "queued")) text += " Сказанное сохранено на устройстве — отправлю, как только получится.";
+    if (outbox.some((e) => e.state === "queued")) {
+      // обещаем только то, что на самом деле так
+      text += !saved ? " Сохранить на устройстве не получилось: не закрывай приложение, пока сообщение не уйдёт."
+        : HOME ? " Сказанное сохранено на устройстве — отправлю, как только получится."
+          : " Сказанное сохранено до закрытия вкладки — отправлю, как только получится.";
+    }
     return text;
   }
 
@@ -244,8 +290,36 @@
     schedule();
   }
 
+  // Не вышло: либо ключ больше не подходит (тогда на настройку), либо говорим, что случилось, и ждём.
+  function halt(kind, status) {
+    if (kind === "auth" || kind === "forbidden" || kind === "notfound") toSetup(L.errorText(kind, status));
+    else setBanner(trouble(kind, status), true);
+  }
+
   async function deliver(e) {
     for (;;) {
+      // У прошлой попытки исход неизвестен: файл мог лечь, и его могли уже разобрать и убрать. Тогда
+      // повторный PUT записал бы сообщение второй раз. Поэтому сначала свежая сводка: есть в ней ответ
+      // с этим id — сообщение дошло. (У отметок ответов не бывает, а их повтор ничего не меняет.)
+      if (e.tried && e.file.type === "text") {
+        const r = await probe(token);
+        if (screen !== "app") return false;
+        if (r.kind === "ok") {
+          accept(r.state);
+          const reply = L.replyTo(r.state, e.id);
+          if (reply) {
+            markSent(e, 0);
+            e.dispatched = reply.ok !== false;   // разбор не удался — файл ещё во входящих, позовём разбор снова
+            saveLocal();
+            return true;
+          }
+        } else if (["auth", "forbidden", "notfound", "offline", "timeout"].includes(r.kind)) {
+          halt(r.kind, r.status);                // ключ не подходит или связи нет: отправлять сейчас бессмысленно
+          return false;
+        }
+        // Сводки нет или она не читается по другой причине — отправляем: сообщение с тем же id
+        // ядро второй раз не применит.
+      }
       const was = { tried: e.tried, renamed: e.renamed };
       e.tried = true;   // если приложение закроют посреди запроса, исход останется неизвестным
       saveLocal();
@@ -253,8 +327,12 @@
         markSent(e, await api.put(token, e.file));
         return true;
       } catch (err) {
-        if (err.kind !== "offline" && err.kind !== "timeout") e.tried = was.tried;
+        // связь оборвалась, время вышло или сервер ответил ошибкой — файл мог лечь; в остальных случаях точно нет
+        if (err.kind !== "offline" && err.kind !== "timeout" && err.kind !== "server") e.tried = was.tried;
         const act = L.afterPutError(was, err.kind, err.status);
+        // 409: GitHub в этот миг принимал другой коммит и наш файл не записал. Пробуем снова сразу,
+        // под тем же именем, до трёх раз; не вышло — сообщение ждёт следующего опроса.
+        if (act === "later" && err.status === 409 && (e.conflicts = (e.conflicts || 0) + 1) <= 3) continue;
         if (act === "delivered") {
           markSent(e, 0);
           return true;
@@ -266,8 +344,7 @@
           continue;
         }
         saveLocal();
-        if (act === "setup") toSetup(L.errorText(err.kind, err.status));
-        else setBanner(trouble(err.kind, err.status), true);
+        halt(err.kind, err.status);
         return false;
       }
     }
@@ -300,11 +377,16 @@
       field.focus();
       return;
     }
+    // Этот текст уже стоит в исходящих и остался в поле только потому, что его не удалось сохранить
+    // на устройстве: второе нажатие «Отправить» не должно создать второе сообщение.
+    if (held && held.state === "queued" && held.file.text === text) {
+      flushOutbox();
+      return;
+    }
     const now = Date.now();
-    outbox.push(L.outboxEntry(L.textMessage(newId(now), L.isoAt(now, offset()), text), now));
-    saveLocal();           // сначала сохранили, потом очистили поле
-    field.value = "";
-    store.set("draft", "");
+    held = L.outboxEntry(L.textMessage(newId(now), L.isoAt(now, offset()), text), now);
+    outbox.push(held);
+    saveLocal();           // сохранилось — поле очистится тут же; нет — когда сообщение уйдёт в GitHub
     flushOutbox();         // в конце сам перерисует
     render();
   }
@@ -534,14 +616,13 @@
         ] : el("p", { class: "empty" }, "Дней пока нет.")),
       el("section", { class: "panel" },
         el("h2", null, "Итоги по месяцу"),
-        vm.months.length ? [
-          vm.months.map((m) => [
+        vm.months.length
+          ? vm.months.map((m) => [
             el("h3", null, L.fmtMonth(m.month)),
             el("div", { class: "tiles" },
               tile(m.planned, "запланировано"), tile(m.done, "сделано"), tile(m.fail, "не сделано"), tile(m.moved, "перенесено")),
-          ]),
-          el("p", { class: "hint" }, "Считается по дням из таблицы выше — за последние 30 дней."),
-        ] : el("p", { class: "empty" }, "Пока нечего считать.")),
+          ]).concat(vm.monthsFromDays ? [el("p", { class: "hint" }, "Посчитано по дням за последние 30 дней.")] : [])
+          : el("p", { class: "empty" }, "Пока нечего считать.")),
       el("section", { class: "panel" },
         el("h2", null, "Решения"),
         vm.decisions.length
@@ -568,7 +649,7 @@
         m.text ? el("p", { class: "said" }, m.text) : null,
         m.phase !== "answered" ? el("p", { class: "reply wait" }, WAIT[m.phase]) : null,
         m.phase === "answered" && m.reply ? el("p", { class: "reply" }, m.reply) : null,
-        !m.ok ? el("p", { class: "msg-note" }, "Пока не разобрано. Сообщение сохранено, попробую ещё раз.") : null,
+        !m.ok ? el("p", { class: "msg-note" }, "Не разобрано. Текст сообщения сохранён.") : null,
         m.ok && m.errors ? el("p", { class: "msg-note" }, "Записалось не всё. Скажи это ещё раз другими словами.") : null))
       : el("p", { class: "empty lone" }, "Здесь появятся твои сообщения и ответы на них.")));
   }
@@ -638,6 +719,7 @@
   // ---------- запуск ----------
 
   $("say").value = String(store.get("draft") || "");
+  if (!MOCK && !HOME) $("setupForm").append(el("p", { class: "hint" }, "В обычной вкладке ключ хранится только до её закрытия."));
   setBanner("");
   setTab(location.hash.slice(1));   // #say и т. п. — открыть сразу нужную вкладку
   if (!MOCK && !L.validRepo(REPO)) toSetup("В config.js неверное имя репозитория памяти.");

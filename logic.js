@@ -165,11 +165,15 @@
   }
 
   // Что делать с сообщением, если PUT не прошёл.
-  // entry.tried — у прошлой попытки исход неизвестен (связь оборвалась посреди запроса).
+  // entry.tried — у прошлой попытки исход неизвестен (связь оборвалась, время вышло, сервер ответил ошибкой).
   function afterPutError(entry, kind, status) {
     if (kind === "conflict") {
-      if (status === 422 && entry.tried) return "delivered";   // файл уже лежит: прошлая попытка дошла
-      return entry.renamed ? "later" : "rename";               // один раз пробуем под новым именем
+      // 409: ничего не записано. Повторяем позже под тем же именем: под новым файл встал бы
+      // позже следующих, и отметки применились бы не в том порядке.
+      if (status === 409) return "later";
+      // 422: файл с таким именем уже лежит. После попытки с неизвестным исходом это наш же файл.
+      if (entry.tried) return "delivered";
+      return entry.renamed ? "later" : "rename";   // имя занято чужим файлом: один раз пробуем под новым
     }
     if (kind === "auth" || kind === "forbidden" || kind === "notfound") return "setup";
     return "later";
@@ -298,6 +302,9 @@
     sentAt: null, createdAt: nowMs,
   });
 
+  // Ответ на сообщение с таким id, если он уже есть в сводке: значит, файл дошёл и его разобрали.
+  const replyTo = (state, id) => (state && state.replies.find((r) => r && r.id === id)) || null;
+
   // Что можно забыть: отправленные отметки (дальше они живут в pending), сообщения с пришедшим ответом
   // и очень старые. Неотправленное не трогаем никогда.
   function pruneOutbox(outbox, state, nowMs) {
@@ -410,25 +417,39 @@
     }));
   }
 
-  // «Обзор»: дни (новые сверху), итоги по месяцам из тех же дней, решения.
-  function deriveReview(state) {
-    const tt = titles(state);
-    const days = [...state.days].sort((a, b) => String(b.date).localeCompare(String(a.date)));
+  // Итоги месяцев, новые сверху. Счёт по месяцу ведёт ядро (state.months): в таблице дней только
+  // последние 30, а задача, перенесённая внутри месяца, в сумме дней посчиталась бы дважды.
+  // Сумма по дням — только для сводки от прежнего ядра, где поля months ещё нет.
+  function monthTotals(state, days) {
+    const num = (v) => Number(v) || 0;
+    if (Array.isArray(state.months)) {
+      return state.months
+        .filter((m) => m && m.month)
+        .map((m) => ({ month: String(m.month), planned: num(m.planned), done: num(m.done), fail: num(m.fail), moved: num(m.moved) }))
+        .sort((a, b) => b.month.localeCompare(a.month));
+    }
     const byMonth = new Map();
     for (const d of days) {
       const key = String(d.date).slice(0, 7);
       if (!byMonth.has(key)) byMonth.set(key, { month: key, days: 0, planned: 0, done: 0, fail: 0, moved: 0 });
       const m = byMonth.get(key);
       m.days++;
-      for (const k of ["planned", "done", "fail", "moved"]) m[k] += Number(d[k]) || 0;
+      for (const k of ["planned", "done", "fail", "moved"]) m[k] += num(d[k]);
     }
+    return [...byMonth.values()];
+  }
+
+  // «Обзор»: дни (новые сверху), итоги по месяцам, решения.
+  function deriveReview(state) {
+    const tt = titles(state);
+    const days = [...state.days].sort((a, b) => String(b.date).localeCompare(String(a.date)));
     const decisions = [...state.decisions]
       .sort((a, b) => String(b.date).localeCompare(String(a.date)))
       .map((d) => ({
         id: d.id, title: d.title, date: d.date, areaTitle: tt.area.get(d.area) || d.area || "",
         review_on: d.review_on || null, status: d.status,
       }));
-    return { days, months: [...byMonth.values()], decisions };
+    return { days, months: monthTotals(state, days), monthsFromDays: !Array.isArray(state.months), decisions };
   }
 
   // ---------- пробный режим ----------
@@ -461,10 +482,11 @@
     offsetOf, dateAt, isoAt,
     fmtDay, fmtDayLong, fmtDayShort, fmtRange, fmtMonth, fmtWhen,
     inboxId, inboxPath, cleanText, textMessage, opsMessage, inboxBody, utf8ToBase64,
+    VERSION: "2026-10-05.2",   // та же строка в app.js
     validRepo, request, classify, errorText, afterPutError, serialQueue,
     parseState, dayCounts,
     nextStatus, tapTask, takeBatch, markBatchSent, renameBatch, repairPending, overlayState,
-    outboxEntry, pruneOutbox, isWaiting, buildFeed,
+    outboxEntry, replyTo, pruneOutbox, isWaiting, buildFeed,
     deriveToday, deriveGoals, deriveReview,
     mockProcess,
   };

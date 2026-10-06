@@ -3,7 +3,7 @@
   "use strict";
 
   const L = window.BrainLogic;
-  const VERSION = "2026-10-05.4";   // та же строка в logic.js
+  const VERSION = "2026-10-06.1";   // та же строка в logic.js
   try {
     // При медленной сети запас может отдать app.js и logic.js разных версий. Один раз перезагружаемся:
     // к этому времени запас уже обновился целиком.
@@ -643,7 +643,7 @@
   }
 
   const joined = (...bits) => bits.filter(Boolean).join(" · ");
-  const STATUS = { open: "открыта", done: "сделана", fail: "не сделана" };
+  const STATUS = { open: "открыта", done: "сделана", fail: "не сделана", dropped: "снята" };
 
   // Строка задачи. Нажатие: открыта → сделана → не сделана → открыта.
   const taskRow = (t, caption) => el("li", null,
@@ -651,7 +651,7 @@
       el("span", { class: "box", "aria-hidden": "true" }),
       el("span", { class: "txt" },
         el("span", null, t.time ? el("b", { class: "time" }, t.time) : null, t.text),
-        caption ? el("small", null, caption) : null),
+        t.status === "dropped" || caption ? el("small", null, joined(t.status === "dropped" ? "снята" : "", caption)) : null),
       el("span", { class: "sr" }, STATUS[t.status] || "")));
 
   // Задача, перенесённая с этого дня на другой: видна, но не нажимается.
@@ -764,7 +764,7 @@
           el("h2", null, g.title)),
         el("span", { class: "pct" }, g.pct + "%")),
       bar(g.done, g.total),
-      el("div", { class: "goal-meta" }, joined(`Подзадач сделано: ${g.done} из ${g.total}`, g.topic)),
+      el("div", { class: "goal-meta" }, joined(`Подзадач сделано: ${g.done} из ${g.total}`, g.dropped ? `снято: ${g.dropped}` : "", g.topic)),
       g.done_when ? el("div", { class: "goal-meta" }, "Готово, когда: " + g.done_when) : null,
       g.tasks.length ? el("ul", null, g.tasks.map((t) => taskRow(t, day(t)))) : null);
   }

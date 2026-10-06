@@ -18,7 +18,9 @@
   const TABS = ["today", "goals", "review", "say"];
   const DAYS_BACK = 3;                      // полоса дней: столько дней назад
   const DAYS_AHEAD = 14;                     // и столько вперёд
-  const NEXT = { open: "done", done: "fail", fail: "open" };
+  const NEXT = { open: "done", done: "fail", fail: "open", dropped: "open" };
+  const live = (t) => t.status !== "dropped";   // снятая задача остаётся в списке, но в счёт не идёт
+  const droppedLast = (a, b) => (a.status === "dropped") - (b.status === "dropped");
 
   const pad = (n) => String(n).padStart(2, "0");
   const pct = (n, total) => (total ? Math.round((n / total) * 100) : 0);
@@ -228,7 +230,7 @@
     const c = { planned: 0, done: 0, fail: 0, moved: 0, open: 0 };
     for (const t of tasks) {
       const days = t.days || [];
-      if (!days.includes(d)) continue;
+      if (!days.includes(d) || !live(t)) continue;
       c.planned++;
       const last = days[days.length - 1];
       if (last > d) c.moved++;
@@ -434,11 +436,12 @@
     const main = (isToday && state.today === today && state.main && state.tasks.find((t) => t.id === state.main)) || null;
     const groups = [];
     for (const id of areaOrder(state, list)) {
-      const tasks = list.filter((t) => t.area === id && !(main && t.id === main.id)).map(item).sort(byTime);
+      const tasks = list.filter((t) => t.area === id && !(main && t.id === main.id)).map(item).sort(byTime)
+        .sort(droppedLast);
       if (!tasks.length) continue;
       groups.push({
         id, title: tt.area.get(id) || id, tasks,
-        done: tasks.filter((t) => t.status === "done").length, total: tasks.length,
+        done: tasks.filter((t) => t.status === "done").length, total: tasks.filter(live).length,
       });
     }
     const stays = (t) => t.status === "open" || keep.has(t.id);
@@ -448,7 +451,7 @@
       main: main ? item(main) : null,
       groups,
       done: list.filter((t) => t.status === "done").length,
-      total: list.length,
+      total: list.filter(live).length,
       moved: date < today ? state.tasks.filter((t) => was(t) && t.day > date).map((t) => row(t, tt)) : [],
       hanging: !isToday ? [] : state.tasks.filter((t) => t.day && t.day < today && stays(t))
         .sort((a, b) => b.day.localeCompare(a.day)).map((t) => row(t, tt)),
@@ -467,13 +470,14 @@
       goals: state.goals.filter((g) => g.area === id)
         .sort((a, b) => (a.status !== "active") - (b.status !== "active") || String(a.to).localeCompare(String(b.to)))
         .map((g) => {
-          const subs = state.tasks.filter((t) => t.goal === g.id);
-          const total = subs.length || Number(g.total) || 0;
+          const subs = state.tasks.filter((t) => t.goal === g.id).sort(droppedLast);
+          const total = subs.length ? subs.filter(live).length : Number(g.total) || 0;
           const done = subs.length ? subs.filter((t) => t.status === "done").length : Number(g.done) || 0;
+          const dropped = subs.length ? subs.length - subs.filter(live).length : Number(g.dropped) || 0;
           return {
             id: g.id, title: g.title, horizon: g.horizon, from: g.from, to: g.to,
             done_when: g.done_when || "", status: g.status, topic: tt.topic.get(g.topic) || "",
-            done, total, pct: pct(done, total), tasks: subs.map((t) => row(t, tt)),
+            done, total, dropped, pct: pct(done, total), tasks: subs.map((t) => row(t, tt)),
           };
         }),
     }));
@@ -631,7 +635,7 @@
         ? { ...t, status: want.get(t.id), closed_at: want.get(t.id) === "open" ? null : at } : t));
       next.goals = state.goals.map((g) => {
         const subs = next.tasks.filter((t) => t.goal === g.id);
-        return { ...g, done: subs.filter((t) => t.status === "done").length, total: subs.length };
+        return { ...g, done: subs.filter((t) => t.status === "done").length, total: subs.filter(live).length };
       });
       next.days = state.days.map((d) => ({ ...d, ...dayCounts(next.tasks, d.date) }));
     } else {
@@ -648,7 +652,7 @@
     offsetOf, dateAt, isoAt,
     fmtDay, fmtDayLong, fmtDayShort, fmtRange, fmtMonth, fmtWhen,
     inboxId, inboxPath, cleanText, textMessage, opsMessage, inboxBody, utf8ToBase64,
-    VERSION: "2026-10-05.4",   // та же строка в app.js
+    VERSION: "2026-10-06.1",   // та же строка в app.js
     validRepo, request, classify, errorText, afterPutError, serialQueue,
     parseState, dayCounts,
     nextStatus, tapTask, takeBatch, markBatchSent, renameBatch, repairPending, overlayState,

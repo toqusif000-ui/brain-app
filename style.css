@@ -176,6 +176,11 @@ li + li { border-top: 1px dashed var(--line); }
 .task[data-s="fail"] .box { background: var(--fail); border-color: var(--fail); color: #fff; }
 .task[data-s="fail"] .box::after { content: "✕"; }
 .task[data-s="fail"] .txt > span { color: var(--muted); }
+/* снята как неактуальная: в списке осталась, в счёт не идёт */
+.task[data-s="dropped"] { opacity: .6; }
+.task[data-s="dropped"] .box { border-style: dashed; }
+.task[data-s="dropped"] .box::after { content: "–"; color: var(--muted); }
+.task[data-s="dropped"] .txt > span { text-decoration: line-through; color: var(--muted); }
 /* время события — перед текстом задачи */
 .time { margin-right: .4em; font-weight: 600; font-variant-numeric: tabular-nums; color: var(--accent-ink); }
 .task[data-s="done"] .time, .task[data-s="fail"] .time { color: inherit; }
